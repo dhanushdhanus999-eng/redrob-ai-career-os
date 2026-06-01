@@ -1,0 +1,40 @@
+project:
+  name: india-runs-track1
+  challenge: Intelligent Candidate Discovery
+
+paths:
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+  external_data_dir: data/external
+  outputs_dir: outputs
+  submissions_dir: outputs/submissions
+  figures_dir: outputs/figures
+
+discovery:
+  jobs_patterns:
+    - "*job*.csv"
+    - "*job*.parquet"
+    - "*job*.json"
+    - "*jobs*.xlsx"
+  candidates_patterns:
+    - "*candidate*.csv"
+    - "*candidate*.parquet"
+    - "*profile*.csv"
+    - "*resume*.csv"
+  labels_patterns:
+    - "*label*.csv"
+    - "*ground*truth*.csv"
+    - "*relevance*.csv"
+    - "*qrels*.csv"
+    - "*train*.csv"
+
+evaluation:
+  k_values: [1, 5, 10, 20]
+  split_seed: 42
+  validation_fraction: 0.2
+  test_fraction: 0.1
+
+columns:
+  job_id_aliases: ["job_id", "jobid", "jd_id", "opening_id"]
+  candidate_id_aliases: ["candidate_id", "candidateid", "profile_id", "talent_id"]
+  relevance_aliases: ["relevance", "label", "target", "score", "rel"]
