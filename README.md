@@ -1,11 +1,10 @@
-# India Runs · Track 1
+# Redrob AI Career OS
 
-Dataset-ready foundation for the Redrob AI "Intelligent Candidate Discovery"
-challenge.
+Dataset-ready foundation for the Redrob AI Career OS candidate discovery and ranking platform.
 
 ## Current status
 
-Phases 1 and 2 are implemented in a dataset-ready form as far as the currently
+Phases 1 through 3 are implemented in a dataset-ready form as far as the currently
 available materials allow:
 
 - repository scaffold and package layout
@@ -16,11 +15,13 @@ available materials allow:
 - BM25, dense, and hybrid retrieval baselines
 - structured job and candidate parsing utilities
 - skill ontology and graded skill-matching utilities
-- documentation, memory notes, and a Phase 1 session log
+- semantic, skill, experience, and behavioral feature engineering
+- LightGBM LTR, cross-encoder reranking, LLM reranking, and explanations
+- documentation, memory notes, and phase session logs
 
 The official dataset has not been released into this workspace yet, so the
-dataset-dependent notebooks, baseline runs, and parsing flows are ready to run
-but have not been executed on real challenge data yet.
+dataset-dependent notebooks, baseline runs, and Phase 3 training flows are
+ready to run but have not been executed on real challenge data yet.
 
 ## Quick start
 
@@ -50,7 +51,18 @@ but have not been executed on real challenge data yet.
    python notebooks/10_skill_ontology.py
    ```
 
-7. Score any ranked output file:
+7. Run the Phase 3 core system once jobs, candidates, and labels are present:
+
+   ```bash
+   python notebooks/11_semantic_features.py
+   python notebooks/12_skill_features.py
+   python notebooks/13_experience_features.py
+   python notebooks/14_behavioral_features.py
+   python notebooks/15_train_ltr.py
+   python notebooks/20_phase3_pipeline.py
+   ```
+
+8. Score any ranked output file:
 
    ```bash
    python -m src.eval.score_submission --pred outputs/submissions/your_file.csv
@@ -78,3 +90,4 @@ Memory/
 - Progress and reusable observations are tracked in `Memory/`.
 - Dataset assumptions and blocked items are tracked in `docs/phase1_status.md`.
 - Phase 2 implementation notes are tracked in `Documents/Phase 2/`.
+- Phase 3 implementation notes are tracked in `Documents/Phase 3/`.

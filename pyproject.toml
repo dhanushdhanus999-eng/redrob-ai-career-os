@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "india-runs-track1"
+name = "redrob-ai-career-os"
 version = "0.1.0"
-description = "Phase 1 foundation for the India Runs Track 1 candidate ranking challenge."
+description = "Redrob AI Career OS candidate discovery and ranking platform."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = { file = "LICENSE" }
