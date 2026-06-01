@@ -1,12 +1,15 @@
-Phase 1 — Foundation (Days 1–4 · May 27–30)
+# Phase 2 — Baselines
 
-* Reference "C:\Projects\India Runs\Documents\India_Runs_by_Redrob_AI.pdf","C:\Projects\India Runs\Documents\India_Runs_Track1_Winning_Plan.md","C:\Projects\India Runs\Documents\Phase 1\Phase1_Implementation.md"
-* I want you to start implementing Phase 1.
+* Reference "C:\Projects\India Runs\Documents\India_Runs_by_Redrob_AI.pdf","C:\Projects\India Runs\Documents\India_Runs_Track1_Winning_Plan.md","C:\Projects\India Runs\Documents\Phase 2\Phase2_Implementation.md"
+* I want you to start implementing Phase 2.
 * Whatever things you learn or want to keep in mind during the upcoming phases, you can create an `.md` or `.txt` file inside:
   `C:\Projects\India Runs\Memory`
 * Things like experiments, observations, and understandings should be stored in Memory so the upcoming phases can be handled smoothly.
-* You should implement Phase 1 end-to-end.
+* You should implement Phase 2 end-to-end.
 * If there is anything you are unsure about, you should ask me.
-* Whatever has been done until this prompt/session should also be documented under the Phase 1 folder as an `.md` file for future reference and understanding.
+* Whatever has been done until this prompt/session should also be documented under the Phase 2 folder as an `.md` file for future reference and understanding.
 
+
+Whatever phase 1 is done that memory is store accordingly, use that to understand what was done so far
+Phase 1 memory and things to keep reminded are updated keep note or just see it.
 Note: I think the team as not released the Dataset Yet, so ignore that part.
