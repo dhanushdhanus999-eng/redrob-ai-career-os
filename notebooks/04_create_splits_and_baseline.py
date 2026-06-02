@@ -1,85 +1,64 @@
-"""Phase 1 Day 4: create fixed splits and a random baseline."""
+"""Phase 1 Day 4: validate the public bundle and sample submission end-to-end."""
 
 from __future__ import annotations
 
 import json
-import random
+import sys
+from pathlib import Path
 
 import pandas as pd
 
-from src.data.discovery import discover_dataset_file
-from src.data.io import load_table
-from src.data.splits import create_splits, labels_to_ground_truth
-from src.eval.metrics import evaluate_rankings, print_metrics
-from src.eval.submission import detect_label_columns
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data.challenge_bundle import (
+    discover_challenge_bundle,
+    load_candidate_id_set,
+    read_docx_text,
+)
+from src.eval.submission import validate_track1_submission
 from src.utils.paths import PROCESSED_DATA_DIR, SUBMISSIONS_DIR, ensure_project_dirs
 
 
 def main() -> None:
     ensure_project_dirs()
-    try:
-        labels_path = discover_dataset_file("labels")
-    except FileNotFoundError as exc:
-        raise SystemExit(f"{exc}\nCopy the labels file into data/raw and rerun.") from exc
+    bundle = discover_challenge_bundle()
 
-    labels = load_table(labels_path)
-    job_col, cand_col, rel_col = detect_label_columns(labels.columns)
-
-    train_df, val_df, test_df = create_splits(
-        labels_df=labels,
-        job_id_col=job_col,
-        val_fraction=0.2,
-        test_fraction=0.1,
-        random_seed=42,
-        save_dir=PROCESSED_DATA_DIR,
+    sample_submission = pd.read_csv(bundle.sample_submission)
+    candidate_ids = load_candidate_id_set(bundle)
+    validation_issues = validate_track1_submission(
+        sample_submission,
+        valid_candidate_ids=candidate_ids,
     )
 
-    print("Saved train/val/test splits to data/processed.")
-    print(
-        {
-            "train_rows": len(train_df),
-            "val_rows": len(val_df),
-            "test_rows": len(test_df),
-        }
-    )
+    bundle_summary = {
+        "bundle_root": str(bundle.root),
+        "candidates_path": str(bundle.candidates),
+        "candidate_schema_path": str(bundle.candidate_schema),
+        "job_description_path": str(bundle.job_description),
+        "sample_submission_path": str(bundle.sample_submission),
+        "submission_spec_path": str(bundle.submission_spec),
+        "candidate_pool_size": len(candidate_ids),
+        "sample_submission_rows": int(len(sample_submission)),
+        "sample_submission_valid": not validation_issues,
+        "sample_submission_issues": validation_issues,
+        "job_description_word_count": len(read_docx_text(bundle.job_description).split()),
+    }
 
-    val_ground_truth = labels_to_ground_truth(
-        labels_df=val_df,
-        job_id_col=job_col,
-        cand_id_col=cand_col,
-        rel_col=rel_col,
-    )
+    summary_path = PROCESSED_DATA_DIR / "phase1_bundle_validation.json"
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(bundle_summary, handle, indent=2)
 
-    all_candidates = labels[cand_col].astype(str).unique().tolist()
-    random.seed(42)
-    random_predictions: dict[str, list[str]] = {}
-    for job_id in val_df[job_col].astype(str).unique():
-        shuffled = all_candidates.copy()
-        random.shuffle(shuffled)
-        random_predictions[str(job_id)] = shuffled[:100]
+    template_rows = sample_submission[["candidate_id", "rank", "score"]].copy()
+    template_rows["reasoning"] = ""
+    template_output_path = SUBMISSIONS_DIR / "submission_working_template.csv"
+    template_rows.to_csv(template_output_path, index=False)
 
-    baseline_metrics = evaluate_rankings(
-        predictions=random_predictions,
-        ground_truth=val_ground_truth,
-        k_values=[1, 5, 10, 20],
-    )
-    print("\nRandom baseline:")
-    print_metrics(baseline_metrics)
-
-    baseline_rows = []
-    for job_id, candidates in random_predictions.items():
-        for rank, candidate_id in enumerate(candidates, start=1):
-            baseline_rows.append({job_col: job_id, cand_col: candidate_id, "rank": rank})
-
-    baseline_path = SUBMISSIONS_DIR / "random_baseline.csv"
-    pd.DataFrame(baseline_rows).to_csv(baseline_path, index=False)
-
-    metrics_path = SUBMISSIONS_DIR / "random_baseline_metrics.json"
-    with metrics_path.open("w", encoding="utf-8") as handle:
-        json.dump(baseline_metrics, handle, indent=2)
-
-    print(f"Saved baseline submission to: {baseline_path}")
-    print(f"Saved baseline metrics to: {metrics_path}")
+    print("Bundle validation complete.")
+    print(json.dumps(bundle_summary, indent=2))
+    print(f"\nSaved validation summary to: {summary_path}")
+    print(f"Saved working submission template to: {template_output_path}")
 
 
 if __name__ == "__main__":

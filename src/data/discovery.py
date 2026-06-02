@@ -6,7 +6,11 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-from src.utils.paths import EXTERNAL_DATA_DIR, RAW_DATA_DIR
+from src.data.challenge_bundle import (
+    CANONICAL_CANDIDATE_DATASET_NAME,
+    CANONICAL_JOB_DATASET_NAME,
+)
+from src.utils.paths import EXTERNAL_DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
 
 DATASET_PATTERNS = {
     "jobs": (
@@ -19,6 +23,8 @@ DATASET_PATTERNS = {
         "*candidate*.csv",
         "*candidate*.parquet",
         "*candidate*.json",
+        "*candidate*.jsonl",
+        "*candidate*.jsonl.gz",
         "*profile*.csv",
         "*resume*.csv",
     ),
@@ -29,6 +35,11 @@ DATASET_PATTERNS = {
         "*qrels*.csv",
         "*train*.csv",
     ),
+}
+
+PREFERRED_FILENAMES = {
+    "jobs": (CANONICAL_JOB_DATASET_NAME,),
+    "candidates": (CANONICAL_CANDIDATE_DATASET_NAME,),
 }
 
 
@@ -45,8 +56,17 @@ def discover_dataset_files(
     if patterns is None:
         raise ValueError(f"Unknown dataset kind: {dataset_kind}")
 
-    roots = tuple(search_dirs or (RAW_DATA_DIR, EXTERNAL_DATA_DIR))
+    roots = tuple(search_dirs or (PROCESSED_DATA_DIR, RAW_DATA_DIR, EXTERNAL_DATA_DIR))
     matches: list[Path] = []
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for filename in PREFERRED_FILENAMES.get(dataset_kind, ()):
+            candidate = root / filename
+            if candidate.exists():
+                matches.append(candidate)
+
     for root in roots:
         if not root.exists():
             continue

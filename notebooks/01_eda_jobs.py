@@ -1,131 +1,115 @@
-"""Phase 1 Day 2: exploratory analysis for job data."""
+"""Phase 1 Day 2: inspect the released single-job challenge brief."""
 
 from __future__ import annotations
 
-import ast
+import json
+import sys
 from collections import Counter
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn as sns
 
-from src.data.discovery import discover_dataset_file, find_columns_with_keywords
-from src.data.io import load_table
-from src.utils.paths import FIGURES_DIR, ensure_project_dirs
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-
-def parse_skills(value: object) -> list[str]:
-    """Parse a skill payload stored as a list, JSON-ish string, or comma list."""
-    if pd.isna(value):
-        return []
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    try:
-        parsed = ast.literal_eval(str(value))
-        if isinstance(parsed, list):
-            return [str(item).strip() for item in parsed if str(item).strip()]
-    except (SyntaxError, ValueError):
-        pass
-    return [item.strip() for item in str(value).split(",") if item.strip()]
+from src.data.challenge_bundle import (
+    discover_challenge_bundle,
+    parse_job_description,
+    read_docx_text,
+    save_canonical_job_dataset,
+)
+from src.utils.paths import FIGURES_DIR, PROCESSED_DATA_DIR, ensure_project_dirs
 
 
-def choose_text_column(df: pd.DataFrame) -> str | None:
-    """Pick the most likely descriptive text column."""
-    text_candidates = find_columns_with_keywords(
-        df.columns,
-        keywords=("description", "job_description", "jd", "summary", "details"),
-    )
-    return text_candidates[0] if text_candidates else None
+def _section_word_counts(text: str) -> pd.Series:
+    markers = [
+        "Let's be honest about this role",
+        "What you'd actually be doing",
+        'What we mean by "5-9 years"',
+        "Things you absolutely need",
+        "Things we'd like you to have but won't reject you for",
+        "Things we explicitly do NOT want",
+        "On location, comp, and logistics",
+        "The vibe check",
+        "How to read between the lines",
+        "Final note for the participants of the Redrob hackathon",
+    ]
+    sections: dict[str, int] = {}
+    current = "Preamble"
+    words: list[str] = []
+
+    for line in (line.strip() for line in text.splitlines()):
+        if not line:
+            continue
+        if line in markers:
+            sections[current] = len(words)
+            current = line
+            words = []
+            continue
+        words.extend(line.split())
+
+    sections[current] = len(words)
+    return pd.Series(sections).sort_values(ascending=False)
 
 
-def choose_skills_column(df: pd.DataFrame) -> str | None:
-    """Pick the most likely skills column."""
-    skill_candidates = find_columns_with_keywords(
-        df.columns,
-        keywords=("skill", "skills", "required_skill", "must_have"),
-    )
-    return skill_candidates[0] if skill_candidates else None
+def _extract_skill_terms(skills_text: str) -> list[str]:
+    skill_counter = Counter()
+    for raw_line in skills_text.splitlines():
+        line = raw_line.strip(" -•\t")
+        if not line or ":" in line:
+            continue
+        for token in line.split(","):
+            cleaned = token.strip()
+            if cleaned:
+                skill_counter[cleaned] += 1
+    return [skill for skill, _ in skill_counter.most_common()]
 
 
 def main() -> None:
     ensure_project_dirs()
-    try:
-        jobs_path = discover_dataset_file("jobs")
-    except FileNotFoundError as exc:
-        raise SystemExit(f"{exc}\nCopy the official jobs file into data/raw and rerun.") from exc
+    bundle = discover_challenge_bundle()
+    job_text = read_docx_text(bundle.job_description)
+    job_row = parse_job_description(job_text)
 
-    jobs = load_table(jobs_path)
-    print(f"Loaded jobs dataset from: {jobs_path}")
-    print(f"Shape: {jobs.shape}")
-    print(f"Columns: {jobs.columns.tolist()}")
-    print("\nDtypes:")
-    print(jobs.dtypes)
+    output_path = save_canonical_job_dataset(bundle)
 
-    if jobs.empty:
-        raise SystemExit("Jobs dataset is empty.")
+    print(f"Challenge bundle root: {bundle.root}")
+    print(f"Saved canonical jobs dataset to: {output_path}")
+    print("\nReleased job row:")
+    print(json.dumps(job_row, indent=2, default=str)[:5000])
 
-    plt.figure(figsize=(12, 4))
-    sns.heatmap(jobs.isna(), yticklabels=False, cbar=False, cmap="YlOrRd")
-    plt.title("Jobs missingness heatmap")
+    word_counts = _section_word_counts(job_text)
+    plt.figure(figsize=(12, 5))
+    word_counts.sort_values().plot(kind="barh", color="#2F4858")
+    plt.title("Job-description section lengths")
+    plt.xlabel("Words")
     plt.tight_layout()
-    plt.savefig(FIGURES_DIR / "jobs_missingness.png")
+    plt.savefig(FIGURES_DIR / "job_description_section_lengths.png")
     plt.close()
 
-    text_col = choose_text_column(jobs)
-    if text_col:
-        word_counts = jobs[text_col].fillna("").astype(str).str.split().map(len)
-        print(f"\nPrimary text column: {text_col}")
-        print(word_counts.describe())
+    summary = {
+        "job_dataset_path": str(output_path),
+        "job_id": job_row["job_id"],
+        "job_title": job_row["job_title"],
+        "company": job_row["company"],
+        "location": job_row["location"],
+        "employment_type": job_row["employment_type"],
+        "min_experience": job_row["min_experience"],
+        "max_experience": job_row["max_experience"],
+        "word_count": len(job_text.split()),
+        "top_sections_by_length": word_counts.head(5).to_dict(),
+        "must_have_keywords": _extract_skill_terms(str(job_row["required_skills"]))[:10],
+        "nice_to_have_keywords": _extract_skill_terms(str(job_row["preferred_skills"]))[:10],
+    }
+    summary_path = PROCESSED_DATA_DIR / "phase1_job_summary.json"
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
-        plt.figure(figsize=(10, 4))
-        word_counts.hist(bins=40, color="#33658A")
-        plt.title(f"Word count distribution for {text_col}")
-        plt.xlabel("Words")
-        plt.tight_layout()
-        plt.savefig(FIGURES_DIR / "jobs_text_length.png")
-        plt.close()
-
-    categorical_columns = [
-        column
-        for column in jobs.select_dtypes(include="object").columns
-        if jobs[column].nunique(dropna=True) <= 20
-    ]
-    for column in categorical_columns[:4]:
-        print(f"\nTop values for {column}:")
-        print(jobs[column].value_counts(dropna=False).head(10))
-
-    skills_col = choose_skills_column(jobs)
-    if skills_col:
-        parsed_skills = jobs[skills_col].apply(parse_skills)
-        jobs["__skill_count__"] = parsed_skills.map(len)
-        skill_counter = Counter(skill for skills in parsed_skills for skill in skills)
-        print(f"\nSkills column: {skills_col}")
-        print(f"Average skills per job: {jobs['__skill_count__'].mean():.2f}")
-        print(f"Unique skills: {len(skill_counter)}")
-        print("Top skills:")
-        print(pd.Series(dict(skill_counter.most_common(20))))
-
-        top_skills = pd.Series(dict(skill_counter.most_common(20)))
-        plt.figure(figsize=(12, 5))
-        top_skills.plot(kind="bar", color="#2F4858")
-        plt.title("Top 20 job skills")
-        plt.tight_layout()
-        plt.savefig(FIGURES_DIR / "jobs_top_skills.png")
-        plt.close()
-
-    numeric_columns = find_columns_with_keywords(
-        jobs.columns,
-        keywords=("experience", "years", "salary", "ctc"),
-    )
-    for column in numeric_columns[:4]:
-        series = pd.to_numeric(jobs[column], errors="coerce").dropna()
-        if series.empty:
-            continue
-        print(f"\nNumeric summary for {column}:")
-        print(series.describe())
-
-    print("\nJobs EDA complete. Review the saved figures in outputs/figures.")
-    print("Update docs/dataset_notes.md with the confirmed findings after review.")
+    print("\nJob EDA complete.")
+    print(f"Saved section-length figure to: {FIGURES_DIR / 'job_description_section_lengths.png'}")
+    print(f"Saved summary to: {summary_path}")
 
 
 if __name__ == "__main__":

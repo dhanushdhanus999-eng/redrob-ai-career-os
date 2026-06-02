@@ -4,14 +4,17 @@ Dataset-ready foundation for the Redrob AI Career OS candidate discovery and ran
 
 ## Current status
 
-Phases 1 through 3 are implemented in a dataset-ready form as far as the currently
-available materials allow:
+Phases 1 through 3 are implemented, and the released public Track 1 bundle is now
+wired into the repository:
 
 - repository scaffold and package layout
 - pinned project configuration in `pyproject.toml`
 - evaluation harness with ranking metrics and tests
-- dataset discovery, loading, and split utilities
-- EDA scripts for jobs, candidates, and labels
+- public-bundle discovery, DOCX extraction, and candidate flattening utilities
+- canonical Phase 1 datasets generated from the released bundle:
+  - `data/processed/challenge_jobs.csv`
+  - `data/processed/challenge_candidates.parquet`
+- EDA scripts for the released job description, candidate pool, and submission spec
 - BM25, dense, and hybrid retrieval baselines
 - structured job and candidate parsing utilities
 - skill ontology and graded skill-matching utilities
@@ -19,9 +22,16 @@ available materials allow:
 - LightGBM LTR, cross-encoder reranking, LLM reranking, and explanations
 - documentation, memory notes, and phase session logs
 
-The official dataset has not been released into this workspace yet, so the
-dataset-dependent notebooks, baseline runs, and Phase 3 training flows are
-ready to run but have not been executed on real challenge data yet.
+The released public bundle is a hidden-evaluation challenge:
+
+- one released job description
+- 100,000 released candidates
+- no public labels or leaderboard
+- a strict top-100 CSV submission contract
+
+That means Phase 1 is fully runnable locally, while Phase 2 and Phase 3 can now
+build rankings from real data but still cannot be locally scored against ground
+truth until organizers reveal labels or final results.
 
 ## Quick start
 
@@ -32,15 +42,23 @@ ready to run but have not been executed on real challenge data yet.
    pip install -e ".[dev]"
    ```
 
-3. Copy the official dataset into `data/raw/`.
-4. Run the dataset exploration scripts in `notebooks/`.
-5. Create splits and the Phase 1 random baseline:
+3. Extract the official public bundle into `data/raw/india_runs_challenge/`.
+4. Run the Phase 1 scripts:
 
    ```bash
+   python notebooks/01_eda_jobs.py
+   python notebooks/02_eda_candidates.py
+   python notebooks/03_understand_labels.py
    python notebooks/04_create_splits_and_baseline.py
    ```
 
-6. Run the Phase 2 baselines and parsers once the dataset is present:
+5. Validate any submission CSV locally before upload:
+
+   ```bash
+   python -m src.eval.validate_submission --pred outputs/submissions/your_submission.csv
+   ```
+
+6. Run the Phase 2 baselines and parsers once the canonical processed datasets exist:
 
    ```bash
    python notebooks/05_bm25_baseline.py
@@ -51,7 +69,7 @@ ready to run but have not been executed on real challenge data yet.
    python notebooks/10_skill_ontology.py
    ```
 
-7. Run the Phase 3 core system once jobs, candidates, and labels are present:
+7. Run the Phase 3 core system once jobs and candidates are prepared:
 
    ```bash
    python notebooks/11_semantic_features.py
@@ -62,11 +80,7 @@ ready to run but have not been executed on real challenge data yet.
    python notebooks/20_phase3_pipeline.py
    ```
 
-8. Score any ranked output file:
-
-   ```bash
-   python -m src.eval.score_submission --pred outputs/submissions/your_file.csv
-   ```
+8. Use `python -m src.eval.score_submission ...` only if labels become available later.
 
 ## Repository layout
 

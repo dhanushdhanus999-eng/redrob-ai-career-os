@@ -9,6 +9,7 @@ __pycache__/
 
 .env
 files.zip
+data/*.zip
 
 data/raw/*
 data/processed/*
