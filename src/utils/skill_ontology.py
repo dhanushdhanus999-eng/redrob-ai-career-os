@@ -7,6 +7,9 @@ from typing import Dict
 
 from rapidfuzz import fuzz, process
 
+from src.utils.failure_fixes import ADDITIONAL_SKILL_SYNONYMS
+from src.utils.text_utils import clean_text
+
 
 SKILL_SYNONYMS: Dict[str, str] = {
     "reactjs": "React",
@@ -43,6 +46,7 @@ SKILL_SYNONYMS: Dict[str, str] = {
     "ci/cd": "CI/CD",
     "llm": "Large Language Models",
 }
+SKILL_SYNONYMS.update(ADDITIONAL_SKILL_SYNONYMS)
 
 SKILL_FAMILIES: Dict[str, list[str]] = {
     "Python Ecosystem": [
@@ -124,14 +128,14 @@ def normalize_skill(skill: str) -> str:
     if not isinstance(skill, str):
         return ""
 
-    cleaned = re.sub(r"\s+", " ", skill.strip().lower())
+    cleaned = re.sub(r"\s+", " ", clean_text(skill).lower())
     if not cleaned:
         return ""
     if cleaned in SKILL_SYNONYMS:
         return SKILL_SYNONYMS[cleaned]
     if cleaned in _CANONICAL_LOOKUP:
         return _CANONICAL_LOOKUP[cleaned]
-    return skill.strip()
+    return clean_text(skill)
 
 
 def normalize_skills_list(skills: list[str]) -> list[str]:

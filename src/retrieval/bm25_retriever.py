@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
+from src.utils.text_utils import clean_text
+
 try:
     from rank_bm25 import BM25Okapi
 except ModuleNotFoundError:
@@ -67,12 +69,15 @@ class _FallbackBM25:
 
 def tokenize(text: str) -> list[str]:
     """Tokenise free text into lightly normalised BM25 terms."""
-    if not isinstance(text, str) or not text.strip():
+    normalized = clean_text(text)
+    if not normalized:
         return []
 
     tokens: list[str] = []
-    for raw_token in _TOKEN_PATTERN.findall(text.lower()):
+    for raw_token in _TOKEN_PATTERN.findall(normalized.lower()):
         token = raw_token.strip("._-")
+        if re.fullmatch(r"\d+(?:[./-]\d+)*", token):
+            continue
         if token and token not in ENGLISH_STOP_WORDS:
             tokens.append(token)
     return tokens
@@ -107,7 +112,7 @@ class BM25Retriever:
         documents: list[str] = []
         candidate_ids = candidates_df[id_col].astype(str).tolist()
         for _, row in candidates_df.iterrows():
-            parts = [str(row[column]).strip() for column in text_cols if pd.notna(row.get(column))]
+            parts = [clean_text(row.get(column)) for column in text_cols if pd.notna(row.get(column))]
             documents.append(" ".join(part for part in parts if part))
         self.build_index(documents=documents, candidate_ids=candidate_ids)
 

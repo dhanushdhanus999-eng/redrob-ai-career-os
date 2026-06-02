@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.baselines.common import Phase2DataBundle, load_phase2_bundle
@@ -16,11 +17,15 @@ from src.data.splits import create_splits
 from src.eval.submission import detect_label_columns
 from src.features.behavioral_features import BehavioralFeatureExtractor
 from src.features.experience_features import ExperienceFeatureExtractor
+from src.features.graph_features import SkillGraph
 from src.features.semantic_features import SemanticFeatureExtractor
 from src.features.skill_features import SkillFeatureExtractor
 from src.parsing.candidate_parser import CandidateProfileParser
 from src.parsing.jd_parser import JobDescriptionParser
+from src.utils.failure_fixes import profile_confidence
 from src.utils.paths import PROCESSED_DATA_DIR, ensure_project_dirs
+from src.utils.skill_ontology import normalize_skills_list
+from src.utils.text_utils import clean_text
 
 
 PARSED_JOBS_PATH = PROCESSED_DATA_DIR / "parsed_jds.json"
@@ -31,12 +36,13 @@ PHASE3_FEATURE_BLOCKS = (
     "features_experience",
     "features_behavioral",
 )
+PHASE4_FEATURE_BLOCKS = PHASE3_FEATURE_BLOCKS + ("features_graph",)
 
 
 def _clean_text(value: object) -> str:
     if value is None or pd.isna(value):
         return ""
-    return str(value).strip()
+    return clean_text(value)
 
 
 def _normalise_name(value: str) -> str:
@@ -75,6 +81,25 @@ class Phase3Context:
     bundle: Phase2DataBundle
     parsed_jobs: dict[str, dict]
     parsed_candidates: dict[str, dict]
+
+
+def build_skill_graph_from_parsed_jobs(parsed_jobs: dict[str, dict]) -> SkillGraph:
+    """Build a skill graph from parsed job requirements."""
+    skill_lists = []
+    for parsed_job in parsed_jobs.values():
+        skills = normalize_skills_list(
+            list(parsed_job.get("must_have_skills", [])) + list(parsed_job.get("nice_to_have_skills", []))
+        )
+        if skills:
+            skill_lists.append(skills)
+    graph = SkillGraph()
+    graph.fit(skill_lists)
+    return graph
+
+
+def build_skill_graph(context: Phase3Context) -> SkillGraph:
+    """Build a reusable skill graph from the loaded Phase 3 context."""
+    return build_skill_graph_from_parsed_jobs(context.parsed_jobs)
 
 
 def canonicalize_labels_frame(
@@ -398,11 +423,39 @@ def _behavioral_feature_frame(pair_inputs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _graph_feature_frame(pair_inputs: pd.DataFrame, skill_graph: SkillGraph) -> pd.DataFrame:
+    rows = []
+    for _, row in pair_inputs.iterrows():
+        required_skills = normalize_skills_list(
+            list(row["must_have_skills"]) + list(row["nice_to_have_skills"])
+        )
+        candidate_skills = normalize_skills_list(list(row["candidate_skills"]))
+        candidate_centrality = [skill_graph.skill_centrality(skill) for skill in candidate_skills]
+        required_centrality = [skill_graph.skill_centrality(skill) for skill in required_skills]
+        features = {
+            "candidate_graph_score": skill_graph.candidate_graph_score(
+                candidate_skills=candidate_skills,
+                required_skills=required_skills,
+            ),
+            "candidate_skill_centrality_mean": (
+                float(np.mean(candidate_centrality)) if candidate_centrality else 0.0
+            ),
+            "required_skill_centrality_mean": (
+                float(np.mean(required_centrality)) if required_centrality else 0.0
+            ),
+        }
+        features["job_id"] = row["job_id"]
+        features["candidate_id"] = row["candidate_id"]
+        rows.append(features)
+    return pd.DataFrame(rows)
+
+
 def generate_feature_frames(
     pair_inputs: pd.DataFrame,
     *,
     feature_names: tuple[str, ...] | list[str] | None = None,
     semantic_extractor: SemanticFeatureExtractor | None = None,
+    skill_graph: SkillGraph | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Generate one or more feature blocks for the given pair inputs."""
     feature_names = tuple(feature_names or PHASE3_FEATURE_BLOCKS)
@@ -430,12 +483,58 @@ def generate_feature_frames(
     if "features_behavioral" in feature_names:
         frames["features_behavioral"] = _behavioral_feature_frame(pair_inputs)
 
+    if "features_graph" in feature_names:
+        if skill_graph is None:
+            derived_jobs = {
+                str(index): {
+                    "must_have_skills": row["must_have_skills"],
+                    "nice_to_have_skills": row["nice_to_have_skills"],
+                }
+                for index, row in pair_inputs.iterrows()
+            }
+            skill_graph = build_skill_graph_from_parsed_jobs(derived_jobs)
+        frames["features_graph"] = _graph_feature_frame(pair_inputs, skill_graph)
+
     return frames
+
+
+def add_confidence_features(
+    features_df: pd.DataFrame,
+    *,
+    parsed_candidates: dict[str, dict] | None = None,
+) -> pd.DataFrame:
+    """Add profile-confidence features derived from candidate completeness."""
+    if features_df.empty:
+        return features_df.copy()
+
+    working = features_df.copy()
+    if parsed_candidates is None and PARSED_CANDIDATES_PATH.exists():
+        with PARSED_CANDIDATES_PATH.open("r", encoding="utf-8") as handle:
+            parsed_candidates = json.load(handle)
+    parsed_candidates = parsed_candidates or {}
+
+    completeness_lookup = {
+        str(candidate_id): candidate.get("profile_completeness", 0.5)
+        for candidate_id, candidate in parsed_candidates.items()
+    }
+    fallback_completeness = (
+        pd.to_numeric(working.get("profile_completeness"), errors="coerce")
+        if "profile_completeness" in working.columns
+        else pd.Series(np.nan, index=working.index, dtype=float)
+    )
+    mapped_completeness = working["candidate_id"].astype(str).map(completeness_lookup)
+    completeness = fallback_completeness.fillna(mapped_completeness).fillna(0.5)
+    working["profile_confidence"] = completeness.map(profile_confidence).astype(float)
+    working["low_profile_confidence"] = (working["profile_confidence"] < 0.5).astype(float)
+    return working
 
 
 def merge_feature_frames(
     base_df: pd.DataFrame,
     feature_frames: dict[str, pd.DataFrame],
+    *,
+    parsed_candidates: dict[str, dict] | None = None,
+    add_confidence: bool = True,
 ) -> pd.DataFrame:
     """Merge one or more Phase 3 feature blocks into a canonical base dataframe."""
     merged = canonicalize_labels_frame(base_df).copy()
@@ -446,6 +545,8 @@ def merge_feature_frames(
         working["job_id"] = working["job_id"].astype(str)
         working["candidate_id"] = working["candidate_id"].astype(str)
         merged = merged.merge(working, on=["job_id", "candidate_id"], how="left")
+    if add_confidence:
+        merged = add_confidence_features(merged, parsed_candidates=parsed_candidates)
     return merged
 
 
@@ -496,4 +597,4 @@ def load_merged_feature_split(
         feature_name: load_feature_frame(feature_name, split)
         for feature_name in feature_names
     }
-    return merge_feature_frames(base_df, frames)
+    return merge_feature_frames(base_df, frames, parsed_candidates=context.parsed_candidates)

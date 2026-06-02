@@ -7,11 +7,15 @@ from typing import Mapping
 import numpy as np
 import pandas as pd
 
+from src.utils.batching import batch_encode
+from src.utils.cache import EmbeddingCache
+from src.utils.text_utils import clean_text
+
 
 def _clean_text(value: object) -> str:
     if value is None or pd.isna(value):
         return ""
-    return str(value).strip()
+    return clean_text(value)
 
 
 def _cosine_from_normalized(left: np.ndarray, right: np.ndarray) -> float:
@@ -43,12 +47,18 @@ class SemanticFeatureExtractor:
         *,
         device: str = "cpu",
         models: Mapping[str, object] | None = None,
+        batch_size: int = 128,
+        cache_embeddings: bool = True,
+        embedding_cache: EmbeddingCache | None = None,
     ) -> None:
         if model_keys is None:
             model_keys = tuple(models.keys()) if models is not None else ("bge_large", "mpnet")
 
         self.model_keys = tuple(model_keys)
         self.device = device
+        self.batch_size = batch_size
+        self.cache_embeddings = cache_embeddings
+        self.embedding_cache = embedding_cache or EmbeddingCache()
         self.models: dict[str, object] = {}
 
         if models is not None:
@@ -67,25 +77,38 @@ class SemanticFeatureExtractor:
 
     def _encode(self, model_key: str, texts: list[str]) -> np.ndarray:
         model = self.models[model_key]
-        kwargs = {
-            "normalize_embeddings": True,
-            "show_progress_bar": False,
-        }
-        try:
-            encoded = model.encode(texts, convert_to_numpy=True, **kwargs)
-        except TypeError:
-            encoded = model.encode(texts, **kwargs)
-        return np.asarray(encoded, dtype=np.float32)
+        return batch_encode(
+            model,
+            texts,
+            batch_size=self.batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
 
     def _embedding_lookup(self, model_key: str, texts: list[str]) -> dict[str, np.ndarray]:
         ordered_unique = list(dict.fromkeys(_clean_text(text) for text in texts))
         if not ordered_unique:
             ordered_unique = [""]
-        embeddings = self._encode(model_key, ordered_unique)
-        return {
-            text: embeddings[idx]
-            for idx, text in enumerate(ordered_unique)
-        }
+        lookup: dict[str, np.ndarray] = {}
+        missing: list[str] = []
+        for text in ordered_unique:
+            if not self.cache_embeddings:
+                missing.append(text)
+                continue
+            cached_embedding = self.embedding_cache.get(text, model_key)
+            if cached_embedding is None:
+                missing.append(text)
+            else:
+                lookup[text] = np.asarray(cached_embedding, dtype=np.float32)
+
+        if missing:
+            encoded = self._encode(model_key, missing)
+            for text, embedding in zip(missing, encoded, strict=False):
+                array = np.asarray(embedding, dtype=np.float32)
+                if self.cache_embeddings:
+                    self.embedding_cache.set(text, model_key, array)
+                lookup[text] = array
+        return lookup
 
     def extract_for_pair(
         self,

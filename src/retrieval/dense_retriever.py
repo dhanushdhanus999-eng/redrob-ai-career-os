@@ -9,6 +9,10 @@ from typing import Protocol, Sequence
 import numpy as np
 import pandas as pd
 
+from src.utils.batching import batch_encode
+from src.utils.fast_index import build_faiss_index
+from src.utils.text_utils import clean_text
+
 try:
     import faiss
 except ModuleNotFoundError:
@@ -96,10 +100,19 @@ class DenseRetriever:
         model_name: str = "BAAI/bge-large-en-v1.5",
         device: str = "cpu",
         encoder: EncoderProtocol | None = None,
+        *,
+        index_type: str = "flat",
+        hnsw_m: int = 32,
+        ivf_n_lists: int | None = None,
+        ivf_nprobe: int = 32,
     ) -> None:
         self.model_name = model_name
         self.device = device
         self.encoder = encoder or SentenceTransformerEncoder(model_name=model_name, device=device)
+        self.index_type = index_type
+        self.hnsw_m = hnsw_m
+        self.ivf_n_lists = ivf_n_lists
+        self.ivf_nprobe = ivf_nprobe
         self.index: object | None = None
         self.candidate_ids: list[str] = []
 
@@ -115,7 +128,8 @@ class DenseRetriever:
         if not documents:
             raise ValueError("At least one candidate document is required.")
 
-        embeddings = self.encoder.encode(
+        embeddings = batch_encode(
+            self.encoder,
             list(documents),
             batch_size=batch_size,
             normalize_embeddings=True,
@@ -125,8 +139,7 @@ class DenseRetriever:
             raise ValueError("The encoder must return a 2D embedding matrix.")
 
         self.candidate_ids = [str(candidate_id) for candidate_id in candidate_ids]
-        self.index = self._new_index(int(embeddings.shape[1]))
-        self.index.add(np.asarray(embeddings, dtype=np.float32))
+        self.index = self._build_index(np.asarray(embeddings, dtype=np.float32))
 
     def build_from_frame(
         self,
@@ -139,7 +152,7 @@ class DenseRetriever:
         documents: list[str] = []
         candidate_ids = candidates_df[id_col].astype(str).tolist()
         for _, row in candidates_df.iterrows():
-            parts = [str(row[column]).strip() for column in text_cols if pd.notna(row.get(column))]
+            parts = [clean_text(row.get(column)) for column in text_cols if pd.notna(row.get(column))]
             documents.append(" ".join(part for part in parts if part))
         self.build_index(documents=documents, candidate_ids=candidate_ids, batch_size=batch_size)
 
@@ -147,10 +160,12 @@ class DenseRetriever:
         """Return the top-k dense retrieval results for a query."""
         if self.index is None:
             raise RuntimeError("Dense index has not been built yet.")
-        if not isinstance(query, str) or not query.strip():
+        query = clean_text(query)
+        if not query:
             return []
 
-        query_embedding = self.encoder.encode(
+        query_embedding = batch_encode(
+            self.encoder,
             [query],
             batch_size=1,
             normalize_embeddings=True,
@@ -177,9 +192,21 @@ class DenseRetriever:
             faiss.write_index(self.index, str(path) + ".faiss")
         else:
             with Path(str(path) + ".index.pkl").open("wb") as handle:
-                pickle.dump({"vectors": self.index.vectors}, handle)
+                pickle.dump(
+                    {
+                        "vectors": self.index.vectors,
+                        "index_type": self.index_type,
+                    },
+                    handle,
+                )
         with (Path(str(path) + ".meta.pkl")).open("wb") as handle:
-            pickle.dump({"candidate_ids": self.candidate_ids}, handle)
+            pickle.dump(
+                {
+                    "candidate_ids": self.candidate_ids,
+                    "index_type": self.index_type,
+                },
+                handle,
+            )
 
     def load(self, path: str | Path) -> None:
         """Load a persisted FAISS index and candidate metadata."""
@@ -192,14 +219,22 @@ class DenseRetriever:
             with numpy_path.open("rb") as handle:
                 payload = pickle.load(handle)
             vectors = np.asarray(payload["vectors"], dtype=np.float32)
-            self.index = self._new_index(int(vectors.shape[1]))
+            self.index = _NumpyInnerProductIndex(int(vectors.shape[1]))
             self.index.add(vectors)
         with (Path(str(path) + ".meta.pkl")).open("rb") as handle:
             payload = pickle.load(handle)
         self.candidate_ids = [str(candidate_id) for candidate_id in payload["candidate_ids"]]
+        self.index_type = str(payload.get("index_type", self.index_type))
 
-    @staticmethod
-    def _new_index(dimension: int) -> object:
-        if faiss is not None:
-            return faiss.IndexFlatIP(dimension)
-        return _NumpyInnerProductIndex(dimension)
+    def _build_index(self, embeddings: np.ndarray) -> object:
+        if faiss is None:
+            index = _NumpyInnerProductIndex(int(embeddings.shape[1]))
+            index.add(embeddings)
+            return index
+        return build_faiss_index(
+            embeddings,
+            index_type=self.index_type,
+            hnsw_m=self.hnsw_m,
+            ivf_n_lists=self.ivf_n_lists,
+            ivf_nprobe=self.ivf_nprobe,
+        )
