@@ -1,0 +1,17 @@
+{
+  "_comment": "LightGBM LambdaRank hyperparameters. Update after running notebooks/28_final_hparam_sweep.py with real labels.",
+  "objective": "lambdarank",
+  "metric": "ndcg",
+  "ndcg_eval_at": [10, 50],
+  "num_leaves": 63,
+  "learning_rate": 0.05,
+  "n_estimators": 500,
+  "min_child_samples": 20,
+  "subsample": 0.8,
+  "colsample_bytree": 0.8,
+  "reg_alpha": 0.1,
+  "reg_lambda": 0.1,
+  "label_gain": [0, 1, 3, 7, 15],
+  "verbose": -1,
+  "n_jobs": -1
+}

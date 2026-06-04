@@ -10,10 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = { file = "LICENSE" }
 authors = [
-  { name = "Codex" }
+  { name = "India Runs Track 1", email = "rohitrajputfromup12@gmail.com" }
 ]
 dependencies = [
   "faiss-cpu==1.11.0",
+  "gradio==5.50.0",
   "joblib==1.5.1",
   "jupyter==1.1.1",
   "lightgbm==4.6.0",

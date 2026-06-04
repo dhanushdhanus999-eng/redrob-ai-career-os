@@ -29,7 +29,6 @@ outputs/submissions/*
 !outputs/figures/.gitkeep
 !outputs/submissions/.gitkeep
 
-docs/
 Documents/
 Memory/
 Prompts/

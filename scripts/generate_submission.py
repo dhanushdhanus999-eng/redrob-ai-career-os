@@ -1,0 +1,524 @@
+"""Official India Runs Track 1 submission generator.
+
+Pipeline stages:
+  Stage 0: Load BM25 index (built from 100K candidate pool)
+  Stage 1: BM25 recall — top recall_k candidates
+  Stage 1b: Semantic similarity scoring (all-mpnet-base-v2, optional)
+  Stage 2: Multi-signal scoring:
+             BM25 norm  × 0.20
+             Semantic   × 0.18  (if model available, else redistributed)
+             Skill match× 0.22  (expanded ontology — 60+ synonyms, 13 families)
+             Role score × 0.13  (AI Engineer → 1.0, HR Manager → 0.1)
+             Exp fit    × 0.10
+             Behavioral × 0.10
+             Career     × 0.07  (consulting-firm penalty baked in)
+  Stage 3: Cross-encoder re-rank of top 50 (optional)
+  Stage 4: LLM listwise re-rank of top 30 (optional, --llm-rerank)
+  Output:  100-row CSV: candidate_id, rank, score, reasoning
+
+Usage:
+    python scripts/generate_submission.py                    # recommended default
+    python scripts/generate_submission.py --no-semantic      # skip mpnet (faster)
+    python scripts/generate_submission.py --no-crossencoder  # skip cross-encoder
+    python scripts/generate_submission.py --llm-rerank       # add Claude Haiku pass
+    python scripts/generate_submission.py --validate         # validate after run
+    python scripts/generate_submission.py --recall-k 2000    # wider BM25 recall
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.baselines.common import build_candidate_documents, load_phase2_bundle
+from src.data.challenge_bundle import discover_challenge_bundle, load_candidate_id_set
+from src.data.schema import combine_text_values
+from src.eval.submission import validate_track1_submission
+from src.parsing.candidate_parser import CandidateProfileParser
+from src.parsing.jd_parser import JobDescriptionParser
+from src.ranking.explainer import explain_ranking
+from src.retrieval.bm25_retriever import BM25Retriever
+from src.utils.paths import MODELS_DIR, SUBMISSIONS_DIR, ensure_project_dirs
+from src.utils.role_relevance import score_career_trajectory, score_role_relevance
+from src.utils.skill_ontology import SkillMatcher
+
+BM25_INDEX = MODELS_DIR / "bm25_demo_index.pkl"
+TOP_K = 100
+
+
+# ── Track 1 JD — hardcoded must-have and nice-to-have skills ────────────────
+# Extracted directly from the DOCX job description for precision.
+# The JD parser's rule-based extraction misses most of these due to prose format.
+
+TRACK1_MUST_HAVE_SKILLS: list[str] = [
+    "Python",
+    "Embeddings",
+    "Sentence Transformers",
+    "BGE Embeddings",
+    "E5 Embeddings",
+    "OpenAI Embeddings",
+    "Vector Databases",
+    "Qdrant",
+    "Pinecone",
+    "Weaviate",
+    "Milvus",
+    "FAISS",
+    "OpenSearch",
+    "Elasticsearch",
+    "Hybrid Search",
+    "Dense Retrieval",
+    "Semantic Search",
+    "NDCG",
+    "MRR",
+    "MAP",
+    "A/B Testing",
+    "Retrieval Augmented Generation",
+    "Large Language Models",
+    "Ranking",
+    "Reranking",
+]
+
+TRACK1_NICE_TO_HAVE_SKILLS: list[str] = [
+    "LoRA",
+    "QLoRA",
+    "PEFT",
+    "Fine-Tuning",
+    "Learning to Rank",
+    "LambdaRank",
+    "LightGBM",
+    "XGBoost",
+    "LangChain",
+    "LlamaIndex",
+    "MLflow",
+    "Kubeflow",
+    "FastAPI",
+    "Distributed Systems",
+    "Hugging Face",
+    "PyTorch",
+    "Anthropic SDK",
+    "Open Source",
+]
+
+TRACK1_MIN_YEARS = 5.0
+TRACK1_MAX_YEARS = 9.0
+TRACK1_JOB_TITLE = "Senior AI Engineer - Founding Team"
+TRACK1_JOB_SENIORITY = "senior"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def score_behavior(row: pd.Series) -> float:
+    """Composite behavioral/activity score in [0, 1]."""
+    completeness = _safe_float(row.get("profile_completeness_score")) / 100.0
+    if completeness == 0.0:
+        completeness = _safe_float(row.get("profile_completeness"))
+
+    response_rate = _safe_float(row.get("recruiter_response_rate"))
+    github        = min(_safe_float(row.get("github_activity_score")) / 100.0, 1.0)
+    saved         = min(_safe_float(row.get("saved_by_recruiters_30d")) / 10.0, 1.0)
+    search        = min(_safe_float(row.get("search_appearance_30d")) / 500.0, 1.0)
+    assessment    = min(_safe_float(row.get("skill_assessment_avg")) / 100.0, 1.0)
+    open_to_work  = 1.0 if bool(row.get("open_to_work_flag")) else 0.0
+
+    recency = 0.4
+    raw_last = _safe_text(row.get("last_active"))
+    if raw_last:
+        try:
+            active_date = datetime.fromisoformat(raw_last[:10]).date()
+            days_since = max((date.today() - active_date).days, 0)
+            recency = max(0.0, 1.0 - days_since / 180.0)
+        except ValueError:
+            pass
+
+    return round(float(np.clip(
+        0.25 * completeness
+        + 0.20 * recency
+        + 0.20 * response_rate
+        + 0.10 * open_to_work
+        + 0.10 * github
+        + 0.05 * saved
+        + 0.05 * search
+        + 0.05 * assessment,
+        0.0, 1.0,
+    )), 6)
+
+
+def score_experience(cand_years: float, min_years: float, max_years: float) -> float:
+    """Score candidate years-of-experience against the JD range."""
+    if not min_years and not max_years:
+        return 0.5
+    if min_years and cand_years < min_years:
+        return round(max(0.0, cand_years / max(min_years, 1.0)), 6)
+    if max_years and cand_years > max_years:
+        extra = cand_years - max_years
+        return round(max(0.45, 1.0 - extra / max(max_years * 2.0, 1.0)), 6)
+    return 1.0
+
+
+# ── Optional: semantic similarity model ──────────────────────────────────────
+
+def _load_semantic_model(model_name: str = "sentence-transformers/all-mpnet-base-v2"):
+    try:
+        from sentence_transformers import SentenceTransformer
+        print(f"  Loading semantic model ({model_name})…")
+        return SentenceTransformer(model_name, device="cpu")
+    except Exception as exc:
+        print(f"  Semantic model unavailable ({exc}) — semantic scores set to 0.5.")
+        return None
+
+
+def _semantic_scores(
+    model,
+    job_text: str,
+    candidate_texts: list[str],
+    batch_size: int = 64,
+) -> list[float]:
+    if model is None:
+        return [0.5] * len(candidate_texts)
+
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    job_emb = model.encode([job_text], normalize_embeddings=True, show_progress_bar=False)
+    scores: list[float] = []
+    for i in range(0, len(candidate_texts), batch_size):
+        batch = candidate_texts[i : i + batch_size]
+        embs = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+        scores.extend(cosine_similarity(job_emb, embs)[0].tolist())
+    return scores
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+def build_submission(
+    *,
+    recall_k: int = 1000,
+    use_semantic: bool = True,
+    use_cross_encoder: bool = True,
+    use_llm_rerank: bool = False,
+) -> pd.DataFrame:
+    ensure_project_dirs()
+
+    # ── Load data ────────────────────────────────────────────────────────────
+    print("Loading candidate pool…")
+    bundle = load_phase2_bundle(require_labels=False)
+    candidates = bundle.candidates.copy()
+    cand_id_col = bundle.candidate_schema.candidate_id
+    candidates["_cid"] = candidates[cand_id_col].astype(str)
+    lookup = candidates.set_index("_cid", drop=False)
+
+    cand_parser   = CandidateProfileParser()
+    skill_matcher = SkillMatcher()
+
+    # Use hardcoded Track 1 skills — far more accurate than rule-based parser
+    must_skills  = TRACK1_MUST_HAVE_SKILLS
+    nice_skills  = TRACK1_NICE_TO_HAVE_SKILLS
+    min_years    = TRACK1_MIN_YEARS
+    max_years    = TRACK1_MAX_YEARS
+    job_title    = TRACK1_JOB_TITLE
+    job_seniority = TRACK1_JOB_SENIORITY
+
+    # Build JD text from the processed job file (used for retrieval + semantic)
+    job_row  = bundle.jobs.iloc[0]
+    job_text = combine_text_values(job_row, bundle.job_schema.text_columns)
+    if not job_text.strip():
+        job_text = " ".join(must_skills)   # fallback
+
+    print(f"  Job: '{job_title}'")
+    print(f"  Must-have skills: {len(must_skills)}, Nice-to-have: {len(nice_skills)}")
+
+    # ── Stage 0: BM25 index ──────────────────────────────────────────────────
+    retriever = BM25Retriever()
+    if BM25_INDEX.exists():
+        print(f"Loading BM25 index from {BM25_INDEX}…")
+        retriever.load(BM25_INDEX)
+    else:
+        print(f"Building BM25 index ({len(bundle.candidates):,} candidates)…")
+        ids, docs = build_candidate_documents(bundle)
+        retriever.build_index(documents=docs, candidate_ids=ids)
+        BM25_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        retriever.save(BM25_INDEX)
+
+    # ── Stage 1: BM25 recall ─────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    # Query with both the job text AND skill keywords for better lexical recall
+    skill_query = job_text + " " + " ".join(must_skills)
+    recall_results = retriever.retrieve(skill_query, top_k=recall_k)
+    print(f"BM25 recall: {len(recall_results)} candidates in {(time.perf_counter()-t0)*1000:.0f} ms")
+
+    if not recall_results:
+        raise RuntimeError("BM25 recall returned 0 results — rebuild the index.")
+
+    raw_scores = np.asarray([s for _, s in recall_results], dtype=float)
+    score_min  = float(raw_scores.min())
+    score_range = float(raw_scores.max()) - score_min
+
+    # ── Stage 1b: Semantic similarity ────────────────────────────────────────
+    sem_model = _load_semantic_model() if use_semantic else None
+    recalled_profile_texts: list[str] = []
+    for cid, _ in recall_results:
+        try:
+            row = lookup.loc[str(cid)]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            text = _safe_text(row.get("profile_text")) or _safe_text(row.get("headline"))
+        except KeyError:
+            text = ""
+        recalled_profile_texts.append(text)
+
+    print("Computing semantic similarity scores…")
+    raw_sem = _semantic_scores(sem_model, skill_query, recalled_profile_texts)
+    sem_min   = min(raw_sem)
+    sem_range = max(raw_sem) - sem_min
+
+    # ── Stage 2: Multi-signal scoring ────────────────────────────────────────
+    print(f"Multi-signal scoring {len(recall_results)} candidates…")
+    scored: list[dict] = []
+
+    for idx, (cid, raw_bm25) in enumerate(recall_results):
+        bm25_norm = 0.5 if score_range <= 0 else (float(raw_bm25) - score_min) / score_range
+        sem_norm  = 0.5 if sem_range  <= 0 else (raw_sem[idx] - sem_min) / sem_range
+
+        try:
+            row = lookup.loc[str(cid)]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+        except KeyError:
+            row = pd.Series(dtype=object)
+
+        parsed_cand   = cand_parser.parse_row(row, bundle.candidate_schema)
+        cand_skills   = list(parsed_cand.get("skills") or [])
+        cand_years    = _safe_float(
+            parsed_cand.get("total_experience_years"),
+            default=_safe_float(row.get("total_experience")),
+        )
+        cand_seniority = str(parsed_cand.get("seniority", "")).lower()
+
+        skill_match   = skill_matcher.match_score(must_skills, cand_skills)
+        exp_score     = score_experience(cand_years, min_years, max_years)
+        beh_score     = score_behavior(row)
+        role_score    = score_role_relevance(
+            _safe_text(row.get("current_role")),
+            _safe_text(row.get("headline")),
+        )
+        career_score  = score_career_trajectory(_safe_text(row.get("career_history_text")))
+
+        # Weighted formula — role relevance gates behavioural signals
+        if use_semantic:
+            overall = (
+                0.20 * bm25_norm
+                + 0.18 * sem_norm
+                + 0.22 * float(skill_match["composite_score"])
+                + 0.13 * role_score
+                + 0.10 * exp_score
+                + 0.10 * beh_score
+                + 0.07 * career_score
+            )
+        else:
+            # Redistribute semantic weight to BM25 + skill when model unavailable
+            overall = (
+                0.28 * bm25_norm
+                + 0.27 * float(skill_match["composite_score"])
+                + 0.15 * role_score
+                + 0.12 * exp_score
+                + 0.11 * beh_score
+                + 0.07 * career_score
+            )
+
+        scored.append({
+            "candidate_id":   str(cid),
+            "bm25_norm":      bm25_norm,
+            "sem_norm":       sem_norm,
+            "skill_score":    float(skill_match["composite_score"]),
+            "exp_score":      exp_score,
+            "beh_score":      beh_score,
+            "role_score":     role_score,
+            "career_score":   career_score,
+            "overall":        overall,
+            "matched_skills": list(skill_match.get("matched_skills", [])),
+            "missing_skills": list(skill_match.get("missing_skills", [])),
+            "cand_years":     cand_years,
+            "seniority_match": job_seniority == cand_seniority,
+        })
+
+    scored.sort(key=lambda x: x["overall"], reverse=True)
+    top5_roles = [
+        _safe_text(lookup.loc[s["candidate_id"]].get("current_role"))
+        if s["candidate_id"] in lookup.index else "?"
+        for s in scored[:5]
+    ]
+    print(f"Top-5 roles after Stage 2: {top5_roles}")
+
+    # ── Stage 3: Cross-encoder re-rank of top 50 ─────────────────────────────
+    if use_cross_encoder:
+        print("Cross-encoder re-ranking top 50…")
+        try:
+            from src.ranking.cross_encoder import CrossEncoderReranker
+            ce_reranker = CrossEncoderReranker()
+            top50_pairs: list[tuple[str, str]] = []
+            for s in scored[:50]:
+                cid = s["candidate_id"]
+                try:
+                    profile_text = _safe_text(lookup.loc[cid].get("profile_text"))
+                except KeyError:
+                    profile_text = ""
+                top50_pairs.append((cid, profile_text))
+
+            ce_ranked = ce_reranker.rerank(job_text, top50_pairs, top_k=50)
+            ce_order  = {cid: i for i, (cid, _) in enumerate(ce_ranked)}
+            top50_rescored = sorted(
+                scored[:50],
+                key=lambda s: ce_order.get(s["candidate_id"], 99),
+            )
+            scored = top50_rescored + scored[50:]
+            top3 = [s["candidate_id"] for s in scored[:3]]
+            print(f"  Cross-encoder done — top-3: {top3}")
+        except Exception as exc:
+            print(f"  Cross-encoder skipped ({exc})")
+
+    # ── Stage 4: LLM listwise re-rank of top 30 ──────────────────────────────
+    if use_llm_rerank:
+        print("LLM listwise re-ranking top 30…")
+        try:
+            from src.ranking.llm_reranker import LLMReranker
+            reranker = LLMReranker()
+            if not reranker.enabled:
+                print("  ANTHROPIC_API_KEY not set — skipping LLM re-rank.")
+            else:
+                top30_pairs: list[tuple[str, str]] = []
+                for s in scored[:30]:
+                    cid = s["candidate_id"]
+                    try:
+                        profile_text = _safe_text(lookup.loc[cid].get("profile_text"))
+                    except KeyError:
+                        profile_text = ""
+                    top30_pairs.append((cid, profile_text))
+
+                reranked = reranker.rerank(job_text, top30_pairs, top_k=30)
+                reranked_order = {cid: i for i, (cid, _) in enumerate(reranked)}
+                top30 = sorted(
+                    scored[:30],
+                    key=lambda s: reranked_order.get(s["candidate_id"], 99),
+                )
+                scored = top30 + scored[30:]
+                print(f"  LLM re-rank done — top-3: {[s['candidate_id'] for s in scored[:3]]}")
+        except Exception as exc:
+            print(f"  LLM re-rank failed ({exc})")
+
+    # ── Build submission rows ─────────────────────────────────────────────────
+    top = scored[:TOP_K]
+    anchor = top[0]["overall"] if top else 1.0
+
+    rows: list[dict] = []
+    for rank, s in enumerate(top, start=1):
+        normalised_score = round(s["overall"] / max(anchor, 1e-9), 6)
+        reasoning = explain_ranking(
+            rank=rank,
+            job_title=job_title,
+            must_skills=must_skills,
+            nice_skills=nice_skills,
+            candidate_skills=s["matched_skills"] + s["missing_skills"],
+            cand_years_exp=s["cand_years"],
+            job_min_years=min_years,
+            seniority_match=s["seniority_match"],
+            behavioral_score=s["beh_score"],
+            semantic_score=s["sem_norm"],
+        )
+        rows.append({
+            "candidate_id": s["candidate_id"],
+            "rank":         rank,
+            "score":        normalised_score,
+            "reasoning":    reasoning,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--recall-k", type=int, default=1000)
+    parser.add_argument("--no-semantic", action="store_true",
+                        help="Skip semantic similarity scoring (faster, lower quality)")
+    parser.add_argument("--no-crossencoder", action="store_true",
+                        help="Skip cross-encoder re-ranking")
+    parser.add_argument("--llm-rerank", action="store_true",
+                        help="Run LLM listwise re-rank (requires ANTHROPIC_API_KEY)")
+    parser.add_argument("--validate", action="store_true",
+                        help="Validate submission against released candidate pool")
+    parser.add_argument("--output", type=Path,
+                        default=SUBMISSIONS_DIR / "final_submission.csv")
+    args = parser.parse_args()
+
+    t_total = time.perf_counter()
+    submission = build_submission(
+        recall_k=args.recall_k,
+        use_semantic=not args.no_semantic,
+        use_cross_encoder=not args.no_crossencoder,
+        use_llm_rerank=args.llm_rerank,
+    )
+    elapsed = time.perf_counter() - t_total
+    print(f"\nGenerated {len(submission)} rows in {elapsed:.1f}s")
+
+    if args.validate:
+        print("\nValidating against released candidate pool…")
+        try:
+            bundle = discover_challenge_bundle()
+            valid_ids = load_candidate_id_set(bundle)
+            issues = validate_track1_submission(submission, valid_candidate_ids=valid_ids)
+        except FileNotFoundError:
+            issues = validate_track1_submission(submission)
+
+        if issues:
+            print("VALIDATION FAILED:")
+            for issue in issues:
+                print(f"  - {issue}")
+            raise SystemExit(1)
+        print("  Validation passed.")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(args.output, index=False)
+
+    print(f"\n{'='*60}")
+    print(f"Submission saved : {args.output}")
+    print(f"Rows             : {len(submission)}")
+    print(f"Score range      : {submission['score'].min():.4f} – {submission['score'].max():.4f}")
+    print(f"\nTop 10 candidates:")
+    print(submission[["rank", "candidate_id", "score"]].head(10).to_string(index=False))
+    print("="*60)
+
+
+if __name__ == "__main__":
+    main()

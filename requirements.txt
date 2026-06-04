@@ -1,0 +1,35 @@
+# India Runs Track 1 — pinned runtime requirements
+# Generated from pyproject.toml. Install with:  pip install -r requirements.txt
+# For the full editable install (including dev extras), use:  pip install -e ".[dev]"
+
+faiss-cpu==1.11.0
+gradio==5.50.0
+joblib==1.5.1
+lightgbm==4.6.0
+loguru==0.7.3
+matplotlib==3.10.7
+nltk==3.9.2
+numpy==2.2.6
+optuna==4.4.0
+pandas==2.3.0
+plotly==6.1.2
+pyarrow==21.0.0
+pypdf==5.9.0
+pydantic==2.11.5
+python-docx==1.2.0
+python-dotenv==1.1.0
+pyyaml==6.0.2
+rapidfuzz==3.13.0
+rank-bm25==0.2.2
+scikit-learn==1.7.0
+scipy==1.15.3
+seaborn==0.13.2
+sentence-transformers==4.1.0
+torch==2.7.1
+tqdm==4.67.1
+transformers==4.52.4
+wandb==0.20.1
+
+# LLM re-ranking (optional — needed for --llm-rerank flag)
+# anthropic==0.54.0
+# openai==1.82.0
