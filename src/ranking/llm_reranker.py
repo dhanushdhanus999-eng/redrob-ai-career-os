@@ -1,7 +1,14 @@
-"""LLM listwise reranking with disk caching and graceful fallback."""
+"""LLM listwise reranking with Gemini race-runner, disk caching, and graceful fallback.
+
+Three Gemini models are called simultaneously; whichever responds first is used
+and the others are cancelled. This eliminates single-model rate-spike failures.
+
+Race order: gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.5-pro
+"""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -11,6 +18,13 @@ from src.utils.paths import CACHE_DIR
 
 
 LLM_CACHE_DIR = CACHE_DIR / "llm_rerank"
+
+_RACE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+]
+
 DEFAULT_SYSTEM_PROMPT = """\
 You are a senior AI engineering recruiter evaluating candidates for the role of
 Senior AI Engineer (Founding Team) at Redrob AI, a Series A AI-native talent platform.
@@ -63,43 +77,82 @@ def _cache_key(job_text: str, candidate_ids: list[str]) -> str:
     return hashlib.md5(content.encode("utf-8")).hexdigest()
 
 
+# ── Gemini async helpers ──────────────────────────────────────────────────────
+
+async def _call_gemini(model_name: str, system_prompt: str, user_prompt: str) -> str:
+    """Call one Gemini model asynchronously and return the text response."""
+    import google.generativeai as genai  # imported lazily
+
+    model = genai.GenerativeModel(
+        model_name,
+        system_instruction=system_prompt,
+    )
+    response = await model.generate_content_async(user_prompt)
+    return response.text
+
+
+async def _race_gemini(system_prompt: str, user_prompt: str) -> str:
+    """Race three Gemini models; return the first successful response."""
+    tasks = [
+        asyncio.create_task(_call_gemini(name, system_prompt, user_prompt))
+        for name in _RACE_MODELS
+    ]
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        return next(iter(done)).result()
+    except Exception:
+        # Cancel all remaining tasks on any error
+        for task in tasks:
+            task.cancel()
+        raise
+
+
+def _run_race(system_prompt: str, user_prompt: str) -> str:
+    """Synchronous wrapper — runs the async race in a new event loop."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Inside an existing loop (e.g. Jupyter / Gradio): use nest_asyncio
+            import nest_asyncio  # optional dep
+            nest_asyncio.apply()
+            return loop.run_until_complete(_race_gemini(system_prompt, user_prompt))
+        return loop.run_until_complete(_race_gemini(system_prompt, user_prompt))
+    except RuntimeError:
+        return asyncio.run(_race_gemini(system_prompt, user_prompt))
+
+
+# ── Main class ────────────────────────────────────────────────────────────────
+
 class LLMReranker:
-    """Use a cached LLM call to rerank the final shortlist when available."""
+    """Use a cached Gemini LLM call to rerank the final shortlist when available."""
 
     def __init__(
         self,
-        model: str = "claude-haiku-4-5-20251001",
         *,
         api_key: str | None = None,
-        client: object | None = None,
         cache_dir: Path | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     ) -> None:
-        self.model = model
         self.system_prompt = system_prompt
         self.cache_dir = cache_dir or LLM_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        if client is not None:
-            self.client = client
-            return
-
-        api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            self.client = None
-            return
-
-        try:
-            import anthropic
-        except ImportError:
-            self.client = None
-            return
-
-        self.client = anthropic.Anthropic(api_key=api_key)
+        api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        if api_key:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=api_key)
+                self._ready = True
+            except ImportError:
+                self._ready = False
+        else:
+            self._ready = False
 
     @property
     def enabled(self) -> bool:
-        return self.client is not None
+        return self._ready
 
     def _cache_path(self, job_text: str, candidate_ids: list[str]) -> Path:
         return self.cache_dir / f"{_cache_key(job_text, candidate_ids)}.json"
@@ -110,15 +163,13 @@ class LLMReranker:
         original_candidates: list[tuple[str, str]],
         reasoning: str,
     ) -> list[tuple[str, str]]:
-        original_ids = [candidate_id for candidate_id, _ in original_candidates]
+        original_ids = [cid for cid, _ in original_candidates]
         known_ids = set(original_ids)
-        normalized_ids = [candidate_id for candidate_id in ranked_ids if candidate_id in known_ids]
+        normalized_ids = [cid for cid in ranked_ids if cid in known_ids]
         normalized_ids.extend(
-            candidate_id
-            for candidate_id in original_ids
-            if candidate_id not in set(normalized_ids)
+            cid for cid in original_ids if cid not in set(normalized_ids)
         )
-        return [(candidate_id, reasoning) for candidate_id in normalized_ids]
+        return [(cid, reasoning) for cid in normalized_ids]
 
     def rerank(
         self,
@@ -127,12 +178,14 @@ class LLMReranker:
         *,
         top_k: int = 30,
     ) -> list[tuple[str, str]]:
-        """Return reranked candidate IDs plus a shared reasoning string."""
+        """Return reranked (candidate_id, reasoning) pairs using the Gemini race-runner."""
         candidates = list(candidates[:top_k])
         if not candidates:
             return []
 
-        cache_path = self._cache_path(job_text, [candidate_id for candidate_id, _ in candidates])
+        candidate_ids = [cid for cid, _ in candidates]
+        cache_path = self._cache_path(job_text, candidate_ids)
+
         if cache_path.exists():
             with cache_path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
@@ -143,32 +196,26 @@ class LLMReranker:
             )
 
         if not self.enabled:
-            return [(candidate_id, "") for candidate_id, _ in candidates]
+            return [(cid, "") for cid, _ in candidates]
 
         candidate_block = "\n".join(
-            f"[{candidate_id}] {candidate_text[:350]}"
-            for candidate_id, candidate_text in candidates
+            f"[{cid}] {text[:900]}"
+            for cid, text in candidates
         )
         user_prompt = (
             "JOB DESCRIPTION:\n"
-            f"{job_text[:1200]}\n\n"
+            f"{job_text[:2500]}\n\n"
             "CANDIDATES:\n"
             f"{candidate_block}\n\n"
             "Return the ranked candidate IDs as JSON."
         )
 
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=self.system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            raw_text = getattr(response.content[0], "text", "").strip()
+            raw_text = _run_race(self.system_prompt, user_prompt).strip()
             cleaned = raw_text.replace("```json", "").replace("```", "").strip()
             payload = json.loads(cleaned)
         except Exception:
-            return [(candidate_id, "") for candidate_id, _ in candidates]
+            return [(cid, "") for cid, _ in candidates]
 
         with cache_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)

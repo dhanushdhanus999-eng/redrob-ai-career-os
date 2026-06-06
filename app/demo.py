@@ -36,12 +36,13 @@ from src.parsing.jd_parser import JobDescriptionParser
 from src.ranking.explainer import explain_ranking
 from src.retrieval.bm25_retriever import BM25Retriever
 from src.utils.paths import MODELS_DIR
+from src.utils.role_relevance import score_career_trajectory, score_role_relevance
 from src.utils.skill_ontology import SKILL_FAMILIES, SKILL_SYNONYMS, SkillMatcher, normalize_skill
 
 
 BM25_DEMO_INDEX = MODELS_DIR / "bm25_demo_index.pkl"
 DEFAULT_RECALL_K = 300
-SCORE_COLUMNS = ["BM25", "Skill", "Experience Fit", "Behavioral"]
+SCORE_COLUMNS = ["Retrieval", "Skill", "Experience Fit", "Behavioral", "Role Fit"]
 
 
 EXAMPLE_JD = """Senior AI Engineer - Founding Team
@@ -108,10 +109,13 @@ class CandidateScore:
     """Score details for one retrieved candidate."""
 
     candidate_id: str
-    bm25_score: float
+    retrieval_score: float
     skill_score: float
     experience_score: float
     behavioral_score: float
+    role_score: float
+    career_score: float
+    location_score: float
     overall_score: float
     matched_skills: list[str]
     missing_skills: list[str]
@@ -190,6 +194,21 @@ def extract_skill_mentions(text: str, *, max_skills: int = 16) -> list[str]:
             break
 
     return found
+
+
+def score_location(candidate_location: str) -> float:
+    """Score candidate location fit for a Pune/Noida hybrid role in India."""
+    loc = str(candidate_location).lower().strip()
+    india_tokens = (
+        "india", "pune", "noida", "bangalore", "bengaluru",
+        "hyderabad", "mumbai", "delhi", "chennai", "gurugram",
+        "gurgaon", "kolkata", "ahmedabad", "jaipur", "kochi",
+    )
+    if any(t in loc for t in india_tokens):
+        return 1.0
+    if not loc or loc in ("nan", "none", "not specified", ""):
+        return 0.55
+    return 0.25
 
 
 def score_experience(candidate_years: float, min_years: float | None, max_years: float | None) -> float:
@@ -324,8 +343,7 @@ class DemoRankingEngine:
         rank_position: int,
         parsed_job: dict[str, Any],
         candidate_id: str,
-        raw_bm25_score: float,
-        bm25_norm: float,
+        retrieval_norm: float,
     ) -> CandidateScore:
         row = self._candidate_row(candidate_id)
         parsed_candidate = self.candidate_parser.parse_row(row, self.bundle.candidate_schema)
@@ -333,24 +351,42 @@ class DemoRankingEngine:
         candidate_skills = parsed_candidate.get("skills") or _split_skills(row.get("skills"))
         must_skills = list(parsed_job.get("must_have_skills", []))
         nice_skills = list(parsed_job.get("nice_to_have_skills", []))
-        skill_match = self.skill_matcher.match_score(must_skills, candidate_skills)
+
+        # Must-have (75%) + nice-to-have (25%) — identical to submission formula
+        must_match  = self.skill_matcher.match_score(must_skills, candidate_skills)
+        nice_match  = self.skill_matcher.match_score(nice_skills, candidate_skills)
+        skill_score = must_match["composite_score"] * 0.75 + nice_match["composite_score"] * 0.25
 
         candidate_years = _safe_float(
             parsed_candidate.get("total_experience_years"),
             default=_safe_float(row.get("total_experience")),
         )
-        experience = score_experience(
+        experience    = score_experience(
             candidate_years,
             parsed_job.get("min_years_experience"),
             parsed_job.get("max_years_experience"),
         )
-        behavioral = score_behavior(row)
+        behavioral    = score_behavior(row)
+        role          = score_role_relevance(
+            _safe_text(row.get("current_role")),
+            _safe_text(row.get("headline")),
+        )
+        career        = score_career_trajectory(_safe_text(row.get("career_history_text")))
+        cand_location = _safe_text(row.get("location")) or _safe_text(row.get("country"))
+        location      = score_location(cand_location)
 
+        # Unified 8-signal formula — identical weights to generate_submission.py
         overall = (
-            0.38 * bm25_norm
-            + 0.27 * skill_match["composite_score"]
-            + 0.17 * experience
-            + 0.18 * behavioral
+            0.15 * retrieval_norm
+            + 0.22 * skill_score
+            + 0.13 * role
+            + 0.10 * experience
+            + 0.10 * behavioral
+            + 0.07 * career
+            + 0.05 * location
+            # semantic not available in demo (no dense model loaded) → 0.18 absorbed above:
+            # retrieval_norm proxy absorbs the semantic gap in the demo context
+            + 0.18 * retrieval_norm
         )
         rationale = explain_ranking(
             rank=rank_position,
@@ -365,18 +401,21 @@ class DemoRankingEngine:
                 == str(parsed_candidate.get("seniority", "")).lower()
             ),
             behavioral_score=behavioral,
-            semantic_score=bm25_norm,
+            semantic_score=retrieval_norm,
         )
 
         return CandidateScore(
             candidate_id=str(candidate_id),
-            bm25_score=round(bm25_norm, 4),
-            skill_score=float(skill_match["composite_score"]),
-            experience_score=experience,
-            behavioral_score=behavioral,
+            retrieval_score=round(retrieval_norm, 4),
+            skill_score=round(skill_score, 4),
+            experience_score=round(experience, 4),
+            behavioral_score=round(behavioral, 4),
+            role_score=round(role, 4),
+            career_score=round(career, 4),
+            location_score=round(location, 4),
             overall_score=round(float(overall), 4),
-            matched_skills=list(skill_match.get("matched_skills", [])),
-            missing_skills=list(skill_match.get("missing_skills", [])),
+            matched_skills=list(must_match.get("matched_skills", [])),
+            missing_skills=list(must_match.get("missing_skills", [])),
             rationale=rationale,
         )
 
@@ -395,20 +434,17 @@ class DemoRankingEngine:
             return empty, "No candidates retrieved for this job description.", score_breakdown_chart(empty)
 
         raw_scores = np.asarray([score for _, score in recall_results], dtype=float)
-        score_min = float(raw_scores.min())
-        score_max = float(raw_scores.max())
-        score_range = score_max - score_min
+        score_max = float(raw_scores.max()) or 1e-9
 
         scored_candidates: list[CandidateScore] = []
         for index, (candidate_id, raw_score) in enumerate(recall_results, start=1):
-            bm25_norm = 0.5 if score_range <= 0 else (float(raw_score) - score_min) / score_range
+            retrieval_norm = float(raw_score) / score_max
             scored_candidates.append(
                 self._score_candidate(
                     rank_position=index,
                     parsed_job=parsed_job,
                     candidate_id=candidate_id,
-                    raw_bm25_score=float(raw_score),
-                    bm25_norm=bm25_norm,
+                    retrieval_norm=retrieval_norm,
                 )
             )
 
@@ -426,10 +462,11 @@ class DemoRankingEngine:
                     "Location": _safe_text(row.get("location")) or _safe_text(row.get("country")),
                     "Experience (yrs)": round(_safe_float(row.get("total_experience")), 1),
                     "Overall": score.overall_score,
-                    "BM25": score.bm25_score,
+                    "Retrieval": score.retrieval_score,
                     "Skill": score.skill_score,
                     "Experience Fit": score.experience_score,
                     "Behavioral": score.behavioral_score,
+                    "Role Fit": score.role_score,
                     "Matched Skills": ", ".join(score.matched_skills[:5]) or "-",
                     "Missing Skills": ", ".join(score.missing_skills[:5]) or "-",
                     "Top Profile Skills": ", ".join(skills[:6]) or "-",

@@ -41,10 +41,11 @@ def build_bm25(bundle) -> Path:
 
 
 def build_dense(bundle) -> Path:
-    out = MODELS_DIR / "dense_bge_large"
-    if out.exists():
+    out = MODELS_DIR / "dense_demo_index"
+    meta = MODELS_DIR / "dense_demo_index.meta.pkl"
+    if meta.exists():
         print(f"Dense index already exists at {out}")
-        print("  Delete it and rerun to rebuild.")
+        print("  Delete dense_demo_index.* files and rerun to rebuild.")
         return out
 
     try:
@@ -61,16 +62,16 @@ def build_dense(bundle) -> Path:
 
     cand_id_col = bundle.candidate_schema.candidate_id
     ids = bundle.candidates[cand_id_col].astype(str).tolist()
-    texts = [
+    docs = [
         combine_text_values(row, bundle.candidate_schema.text_columns)
         for _, row in bundle.candidates.iterrows()
     ]
 
-    retriever = DenseRetriever(model_key="bge_large")
-    retriever.build_index(candidate_ids=ids, texts=texts)
-    out.mkdir(parents=True, exist_ok=True)
+    retriever = DenseRetriever(model_name="BAAI/bge-large-en-v1.5")
+    retriever.build_index(documents=docs, candidate_ids=ids)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
     retriever.save(out)
-    print(f"Dense index saved to {out}  ({time.perf_counter()-t0:.1f}s)")
+    print(f"Dense index saved to {out}.*  ({time.perf_counter()-t0:.1f}s)")
     return out
 
 
@@ -90,7 +91,7 @@ def main() -> None:
 
     if args.force:
         bm25_path = MODELS_DIR / "bm25_demo_index.pkl"
-        dense_path = MODELS_DIR / "dense_bge_large"
+        dense_path = MODELS_DIR / "dense_demo_index.meta.pkl"
         for p in (bm25_path, dense_path):
             if p.exists():
                 import shutil

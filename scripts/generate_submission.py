@@ -38,6 +38,12 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_ROOT / ".env")
+except ImportError:
+    pass
+
 from src.baselines.common import build_candidate_documents, load_phase2_bundle
 from src.data.challenge_bundle import discover_challenge_bundle, load_candidate_id_set
 from src.data.schema import combine_text_values
@@ -46,11 +52,14 @@ from src.parsing.candidate_parser import CandidateProfileParser
 from src.parsing.jd_parser import JobDescriptionParser
 from src.ranking.explainer import explain_ranking
 from src.retrieval.bm25_retriever import BM25Retriever
+from src.retrieval.dense_retriever import DenseRetriever
+from src.retrieval.hybrid_retriever import HybridRetriever
 from src.utils.paths import MODELS_DIR, SUBMISSIONS_DIR, ensure_project_dirs
 from src.utils.role_relevance import score_career_trajectory, score_role_relevance
 from src.utils.skill_ontology import SkillMatcher
 
 BM25_INDEX = MODELS_DIR / "bm25_demo_index.pkl"
+DENSE_INDEX = MODELS_DIR / "dense_demo_index"
 TOP_K = 100
 
 
@@ -171,6 +180,21 @@ def score_behavior(row: pd.Series) -> float:
     )), 6)
 
 
+def score_location(candidate_location: str) -> float:
+    """Score candidate location fit for a Pune/Noida hybrid role in India."""
+    loc = str(candidate_location).lower().strip()
+    india_tokens = (
+        "india", "pune", "noida", "bangalore", "bengaluru",
+        "hyderabad", "mumbai", "delhi", "chennai", "gurugram",
+        "gurgaon", "kolkata", "ahmedabad", "jaipur", "kochi",
+    )
+    if any(t in loc for t in india_tokens):
+        return 1.0
+    if not loc or loc in ("nan", "none", "not specified", ""):
+        return 0.55
+    return 0.25
+
+
 def score_experience(cand_years: float, min_years: float, max_years: float) -> float:
     """Score candidate years-of-experience against the JD range."""
     if not min_years and not max_years:
@@ -185,7 +209,7 @@ def score_experience(cand_years: float, min_years: float, max_years: float) -> f
 
 # ── Optional: semantic similarity model ──────────────────────────────────────
 
-def _load_semantic_model(model_name: str = "sentence-transformers/all-mpnet-base-v2"):
+def _load_semantic_model(model_name: str = "BAAI/bge-large-en-v1.5"):
     try:
         from sentence_transformers import SentenceTransformer
         print(f"  Loading semantic model ({model_name})…")
@@ -220,7 +244,7 @@ def _semantic_scores(
 
 def build_submission(
     *,
-    recall_k: int = 1000,
+    recall_k: int = 2000,
     use_semantic: bool = True,
     use_cross_encoder: bool = True,
     use_llm_rerank: bool = False,
@@ -255,31 +279,50 @@ def build_submission(
     print(f"  Job: '{job_title}'")
     print(f"  Must-have skills: {len(must_skills)}, Nice-to-have: {len(nice_skills)}")
 
-    # ── Stage 0: BM25 index ──────────────────────────────────────────────────
-    retriever = BM25Retriever()
+    # ── Stage 0: BM25 + Dense indices ───────────────────────────────────────
+    ids: list[str] | None = None
+    docs: list[str] | None = None
+
+    bm25 = BM25Retriever()
     if BM25_INDEX.exists():
         print(f"Loading BM25 index from {BM25_INDEX}…")
-        retriever.load(BM25_INDEX)
+        bm25.load(BM25_INDEX)
     else:
         print(f"Building BM25 index ({len(bundle.candidates):,} candidates)…")
         ids, docs = build_candidate_documents(bundle)
-        retriever.build_index(documents=docs, candidate_ids=ids)
+        bm25.build_index(documents=docs, candidate_ids=ids)
         BM25_INDEX.parent.mkdir(parents=True, exist_ok=True)
-        retriever.save(BM25_INDEX)
+        bm25.save(BM25_INDEX)
 
-    # ── Stage 1: BM25 recall ─────────────────────────────────────────────────
+    dense = DenseRetriever()
+    _dense_meta = DENSE_INDEX.parent / (DENSE_INDEX.name + ".meta.pkl")
+    if _dense_meta.exists():
+        print(f"Loading dense index from {DENSE_INDEX}…")
+        dense.load(DENSE_INDEX)
+    else:
+        if ids is None:
+            print(f"Building candidate documents for dense index…")
+            ids, docs = build_candidate_documents(bundle)
+        print(f"Building dense index ({len(ids):,} candidates) — ~10 min on CPU…")
+        dense.build_index(documents=docs, candidate_ids=ids)
+        DENSE_INDEX.parent.mkdir(parents=True, exist_ok=True)
+        dense.save(DENSE_INDEX)
+
+    retriever = HybridRetriever(bm25_retriever=bm25, dense_retriever=dense)
+
+    # ── Stage 1: Hybrid recall (BM25 + Dense RRF) ───────────────────────────
     t0 = time.perf_counter()
-    # Query with both the job text AND skill keywords for better lexical recall
-    skill_query = job_text + " " + " ".join(must_skills)
-    recall_results = retriever.retrieve(skill_query, top_k=recall_k)
-    print(f"BM25 recall: {len(recall_results)} candidates in {(time.perf_counter()-t0)*1000:.0f} ms")
+    # Only append skill terms that are not already in the job text to avoid double-counting
+    extra_terms = [s for s in must_skills if s.lower() not in job_text.lower()]
+    skill_query = job_text + (" " + " ".join(extra_terms) if extra_terms else "")
+    recall_results = retriever.retrieve(skill_query, top_k=recall_k, recall_k=recall_k)
+    print(f"Hybrid recall: {len(recall_results)} candidates in {(time.perf_counter()-t0)*1000:.0f} ms")
 
     if not recall_results:
         raise RuntimeError("BM25 recall returned 0 results — rebuild the index.")
 
     raw_scores = np.asarray([s for _, s in recall_results], dtype=float)
-    score_min  = float(raw_scores.min())
-    score_range = float(raw_scores.max()) - score_min
+    score_max  = float(raw_scores.max()) or 1e-9
 
     # ── Stage 1b: Semantic similarity ────────────────────────────────────────
     sem_model = _load_semantic_model() if use_semantic else None
@@ -296,16 +339,15 @@ def build_submission(
 
     print("Computing semantic similarity scores…")
     raw_sem = _semantic_scores(sem_model, skill_query, recalled_profile_texts)
-    sem_min   = min(raw_sem)
-    sem_range = max(raw_sem) - sem_min
+    sem_max = max(raw_sem) or 1e-9
 
     # ── Stage 2: Multi-signal scoring ────────────────────────────────────────
     print(f"Multi-signal scoring {len(recall_results)} candidates…")
     scored: list[dict] = []
 
-    for idx, (cid, raw_bm25) in enumerate(recall_results):
-        bm25_norm = 0.5 if score_range <= 0 else (float(raw_bm25) - score_min) / score_range
-        sem_norm  = 0.5 if sem_range  <= 0 else (raw_sem[idx] - sem_min) / sem_range
+    for idx, (cid, raw_retrieval) in enumerate(recall_results):
+        retrieval_norm = float(raw_retrieval) / score_max
+        sem_norm       = float(raw_sem[idx]) / sem_max
 
         try:
             row = lookup.loc[str(cid)]
@@ -314,57 +356,68 @@ def build_submission(
         except KeyError:
             row = pd.Series(dtype=object)
 
-        parsed_cand   = cand_parser.parse_row(row, bundle.candidate_schema)
-        cand_skills   = list(parsed_cand.get("skills") or [])
-        cand_years    = _safe_float(
+        parsed_cand    = cand_parser.parse_row(row, bundle.candidate_schema)
+        cand_skills    = list(parsed_cand.get("skills") or [])
+        cand_years     = _safe_float(
             parsed_cand.get("total_experience_years"),
             default=_safe_float(row.get("total_experience")),
         )
         cand_seniority = str(parsed_cand.get("seniority", "")).lower()
+        cand_location  = _safe_text(row.get("location")) or _safe_text(row.get("country"))
 
-        skill_match   = skill_matcher.match_score(must_skills, cand_skills)
-        exp_score     = score_experience(cand_years, min_years, max_years)
-        beh_score     = score_behavior(row)
-        role_score    = score_role_relevance(
+        # Skill matching: must-have (75%) + nice-to-have (25%)
+        must_match  = skill_matcher.match_score(must_skills, cand_skills)
+        nice_match  = skill_matcher.match_score(nice_skills, cand_skills)
+        skill_score = must_match["composite_score"] * 0.75 + nice_match["composite_score"] * 0.25
+
+        exp_score      = score_experience(cand_years, min_years, max_years)
+        beh_score      = score_behavior(row)
+        role_score     = score_role_relevance(
             _safe_text(row.get("current_role")),
             _safe_text(row.get("headline")),
         )
-        career_score  = score_career_trajectory(_safe_text(row.get("career_history_text")))
+        career_score   = score_career_trajectory(_safe_text(row.get("career_history_text")))
+        location_score = score_location(cand_location)
 
-        # Weighted formula — role relevance gates behavioural signals
+        # Weighted formula — 8 signals, sums to 1.0
+        # retrieval: 0.15, semantic: 0.18, skill: 0.22, role: 0.13,
+        # exp: 0.10, behavioral: 0.10, career: 0.07, location: 0.05
         if use_semantic:
             overall = (
-                0.20 * bm25_norm
+                0.15 * retrieval_norm
                 + 0.18 * sem_norm
-                + 0.22 * float(skill_match["composite_score"])
+                + 0.22 * skill_score
                 + 0.13 * role_score
                 + 0.10 * exp_score
                 + 0.10 * beh_score
                 + 0.07 * career_score
+                + 0.05 * location_score
             )
         else:
-            # Redistribute semantic weight to BM25 + skill when model unavailable
+            # Redistribute semantic weight when model unavailable
             overall = (
-                0.28 * bm25_norm
-                + 0.27 * float(skill_match["composite_score"])
+                0.23 * retrieval_norm
+                + 0.27 * skill_score
                 + 0.15 * role_score
                 + 0.12 * exp_score
                 + 0.11 * beh_score
                 + 0.07 * career_score
+                + 0.05 * location_score
             )
 
         scored.append({
             "candidate_id":   str(cid),
-            "bm25_norm":      bm25_norm,
+            "retrieval_norm": retrieval_norm,
             "sem_norm":       sem_norm,
-            "skill_score":    float(skill_match["composite_score"]),
+            "skill_score":    skill_score,
             "exp_score":      exp_score,
             "beh_score":      beh_score,
             "role_score":     role_score,
             "career_score":   career_score,
+            "location_score": location_score,
             "overall":        overall,
-            "matched_skills": list(skill_match.get("matched_skills", [])),
-            "missing_skills": list(skill_match.get("missing_skills", [])),
+            "matched_skills": list(must_match.get("matched_skills", [])),
+            "missing_skills": list(must_match.get("missing_skills", [])),
             "cand_years":     cand_years,
             "seniority_match": job_seniority == cand_seniority,
         })
@@ -406,12 +459,12 @@ def build_submission(
 
     # ── Stage 4: LLM listwise re-rank of top 30 ──────────────────────────────
     if use_llm_rerank:
-        print("LLM listwise re-ranking top 30…")
+        print("LLM listwise re-ranking top 30 (Gemini race-runner)…")
         try:
             from src.ranking.llm_reranker import LLMReranker
             reranker = LLMReranker()
             if not reranker.enabled:
-                print("  ANTHROPIC_API_KEY not set — skipping LLM re-rank.")
+                print("  GOOGLE_API_KEY not set — skipping LLM re-rank.")
             else:
                 top30_pairs: list[tuple[str, str]] = []
                 for s in scored[:30]:
@@ -435,11 +488,17 @@ def build_submission(
 
     # ── Build submission rows ─────────────────────────────────────────────────
     top = scored[:TOP_K]
-    anchor = top[0]["overall"] if top else 1.0
+    # After cross-encoder / LLM re-ranking the list order no longer matches
+    # the original overall scores, so naively dividing by top[0]["overall"]
+    # produces non-monotonic scores.  Fix: sort the pool of overall scores
+    # descending and assign the k-th highest score to rank k — the re-ranker
+    # decided *who* belongs at each rank; the score just marks that position.
+    overall_pool = sorted([s["overall"] for s in top], reverse=True)
+    anchor = overall_pool[0] if overall_pool else 1.0
 
     rows: list[dict] = []
     for rank, s in enumerate(top, start=1):
-        normalised_score = round(s["overall"] / max(anchor, 1e-9), 6)
+        normalised_score = round(overall_pool[rank - 1] / max(anchor, 1e-9), 6)
         reasoning = explain_ranking(
             rank=rank,
             job_title=job_title,
@@ -469,7 +528,7 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--recall-k", type=int, default=1000)
+    parser.add_argument("--recall-k", type=int, default=2000)
     parser.add_argument("--no-semantic", action="store_true",
                         help="Skip semantic similarity scoring (faster, lower quality)")
     parser.add_argument("--no-crossencoder", action="store_true",

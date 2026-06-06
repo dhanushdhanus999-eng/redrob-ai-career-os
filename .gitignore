@@ -48,3 +48,7 @@ Thumbs.db
 # Additional common ignores
 .ipynb_checkpoints/
 *.log
+
+# Build artifacts
+build_dense_gpu_*.txt
+build_dense_gpu_*.zip

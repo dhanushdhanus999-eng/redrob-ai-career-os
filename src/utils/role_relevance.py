@@ -9,6 +9,7 @@ purely on behavioural signals.
 from __future__ import annotations
 
 import re
+from typing import Sequence
 
 
 # ── Tokens that indicate AI/ML production experience ─────────────────────────
@@ -185,6 +186,43 @@ PRODUCT_AI_CAREER_TOKENS: frozenset[str] = frozenset({
 })
 
 
+_YEAR_PATTERN = re.compile(r"\b(20\d{2}|199\d)\b")
+
+# Tokens that suggest a distinct company in career text
+_COMPANY_TOKENS: tuple[str, ...] = (
+    " inc.", " ltd.", " pvt.", " technologies", " systems",
+    " solutions", " labs", " corp.", " consulting", " services",
+    " software", " tech ", " group", " digital",
+)
+
+
+def _estimate_job_hops(career_history_text: str) -> float:
+    """Estimate a title-chasing penalty from career history text.
+
+    Returns 0.0 when no signal, up to 0.20 when the pattern strongly suggests
+    frequent short-tenure moves (many company tokens relative to years span).
+    """
+    lowered = career_history_text.lower()
+
+    years_found = _YEAR_PATTERN.findall(lowered)
+    if len(years_found) < 2:
+        return 0.0
+
+    year_ints = sorted(int(y) for y in set(years_found))
+    career_span = year_ints[-1] - year_ints[0]
+    if career_span <= 0:
+        return 0.0
+
+    company_count = sum(1 for token in _COMPANY_TOKENS if token in lowered)
+    hops_per_year = company_count / career_span
+
+    if hops_per_year > 1.2:
+        return 0.20    # strong title-chaser signal
+    if hops_per_year > 0.75:
+        return 0.10    # moderate signal
+    return 0.0
+
+
 def _normalise(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).lower().strip())
 
@@ -236,6 +274,9 @@ def score_career_trajectory(career_history_text: str) -> float:
         consulting_penalty = 0.20
     else:
         consulting_penalty = 0.0
+
+    # Title-chasing penalty — frequent short-tenure job hops
+    consulting_penalty = min(consulting_penalty + _estimate_job_hops(career_history_text), 0.55)
 
     # Count AI/ML product signals across the full career history
     ai_hits = sum(1 for token in PRODUCT_AI_CAREER_TOKENS if token in lowered)
