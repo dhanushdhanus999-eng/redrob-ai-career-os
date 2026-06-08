@@ -117,7 +117,48 @@ def draw_architecture() -> Path:
     return _save(fig, "architecture_diagram.png")
 
 
+_PHASE6_FEATURE_GROUPS = {
+    "must_composite": "Skill",
+    "nice_composite": "Skill",
+    "must_exact_cov": "Skill",
+    "nice_exact_cov": "Skill",
+    "n_must_matched": "Skill",
+    "n_must_missing": "Skill",
+    "exp_score": "Experience",
+    "cand_years": "Experience",
+    "career_score": "Experience",
+    "location_score": "Experience",
+    "role_score": "Role",
+    "beh_score": "Behavioral",
+    "completeness": "Behavioral",
+    "response_rate": "Behavioral",
+    "recency": "Behavioral",
+    "github_score": "Behavioral",
+    "saved": "Behavioral",
+    "search_app": "Behavioral",
+    "assessment": "Behavioral",
+    "open_to_work": "Behavioral",
+}
+
+
 def _load_ltr_importance() -> pd.DataFrame | None:
+    """Load real LightGBM gain importances from the active LTR pipeline.
+
+    `scripts/train_ltr.py` (the active path, wired into `generate_submission.py`)
+    writes `outputs/models/ltr_feature_importance.csv` alongside `ltr_model.pkl`.
+    The older Phase-3 `LTRModel.save()` `.lgb` artifact is checked as a fallback
+    for anyone who trained via that wrapper instead.
+    """
+    csv_path = MODELS_DIR / "ltr_feature_importance.csv"
+    if csv_path.exists():
+        try:
+            importance = pd.read_csv(csv_path).head(20)
+            if not importance.empty:
+                importance["group"] = importance["feature"].map(_feature_group)
+                return importance
+        except Exception:
+            pass
+
     model_path = MODELS_DIR / "ltr_final"
     if not Path(str(model_path) + ".lgb").exists():
         return None
@@ -136,6 +177,8 @@ def _load_ltr_importance() -> pd.DataFrame | None:
 
 
 def _feature_group(feature_name: str) -> str:
+    if feature_name in _PHASE6_FEATURE_GROUPS:
+        return _PHASE6_FEATURE_GROUPS[feature_name]
     lowered = feature_name.lower()
     if any(token in lowered for token in ("active", "response", "profile", "saved", "behavior")):
         return "Behavioral"
@@ -151,6 +194,7 @@ def _feature_group(feature_name: str) -> str:
 def draw_feature_importance() -> Path:
     """Draw real LTR importance when possible, otherwise an honest signal map."""
     colors = {
+        "Role": "#E63946",
         "Behavioral": "#F18F01",
         "Skill": "#2E86AB",
         "Semantic": "#7B2CBF",

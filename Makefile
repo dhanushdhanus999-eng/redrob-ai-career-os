@@ -1,7 +1,7 @@
 # India Runs Track 1 — Makefile
 # On Windows: use Git Bash or WSL, or run the equivalent Python commands directly.
 
-.PHONY: setup install test reproduce submit demo demo-smoke validate clean help
+.PHONY: setup install test reproduce reproduce-full submit demo demo-smoke validate ltr clean help
 
 # ── Default ───────────────────────────────────────────────────────────────────
 help:
@@ -46,14 +46,37 @@ reproduce:
 	@echo ""
 	@echo "Reproduction complete."
 	@echo "Submission: outputs/submissions/final_submission.csv"
+	@echo "To activate LTR for better ranking: make ltr && make reproduce"
 
 # ── Final submission (with optional LLM re-rank) ──────────────────────────────
 submit:
 	@echo "==> Generating final submission (LLM re-rank enabled)"
-	@echo "    Requires ANTHROPIC_API_KEY in environment or .env"
+	@echo "    Requires GOOGLE_API_KEY in environment or .env"
 	python scripts/generate_submission.py --llm-rerank --validate
 	@echo ""
 	@echo "Upload outputs/submissions/final_submission.csv to Hack2skill."
+
+# ── LTR training ──────────────────────────────────────────────────────────────
+ltr:
+	@echo "==> Step 1: Create pseudo-relevance labels"
+	python scripts/create_pseudo_labels.py
+	@echo "==> Step 2: Generate LTR feature matrix (100K candidates)"
+	python scripts/generate_features.py
+	@echo "==> Step 3: Train LightGBM LambdaRank"
+	python scripts/train_ltr.py
+	@echo ""
+	@echo "LTR model saved to outputs/models/ltr_model.pkl"
+	@echo "Run 'make reproduce' to generate submission with LTR active."
+
+# ── Full pipeline with LTR (~20 min first run) ────────────────────────────────
+reproduce-full:
+	python scripts/build_indices.py
+	python scripts/parse_data.py --limit 0
+	python scripts/create_pseudo_labels.py
+	python scripts/generate_features.py
+	python scripts/train_ltr.py
+	python scripts/generate_submission.py --validate
+	@echo "Full pipeline complete."
 
 # ── Validate an existing submission ───────────────────────────────────────────
 validate:

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Callable
 
 from src.utils.paths import CACHE_DIR
 
@@ -134,10 +135,19 @@ class LLMReranker:
         api_key: str | None = None,
         cache_dir: Path | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        race_fn: Callable[[str, str], str] | None = None,
     ) -> None:
+        """``race_fn`` overrides the Gemini race-runner — used to inject a fake
+        model call in tests or to swap in an alternative LLM provider without
+        touching the caching/normalisation logic."""
         self.system_prompt = system_prompt
         self.cache_dir = cache_dir or LLM_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._race_fn = race_fn or _run_race
+
+        if race_fn is not None:
+            self._ready = True
+            return
 
         api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if api_key:
@@ -211,7 +221,7 @@ class LLMReranker:
         )
 
         try:
-            raw_text = _run_race(self.system_prompt, user_prompt).strip()
+            raw_text = self._race_fn(self.system_prompt, user_prompt).strip()
             cleaned = raw_text.replace("```json", "").replace("```", "").strip()
             payload = json.loads(cleaned)
         except Exception:

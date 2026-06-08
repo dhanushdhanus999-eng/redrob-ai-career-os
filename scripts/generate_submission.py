@@ -5,7 +5,7 @@ Pipeline stages:
   Stage 1: BM25 recall — top recall_k candidates
   Stage 1b: Semantic similarity scoring (all-mpnet-base-v2, optional)
   Stage 2: Multi-signal scoring:
-             BM25 norm  × 0.20
+             BM25 norm  × 0.15
              Semantic   × 0.18  (if model available, else redistributed)
              Skill match× 0.22  (expanded ontology — 60+ synonyms, 13 families)
              Role score × 0.13  (AI Engineer → 1.0, HR Manager → 0.1)
@@ -20,7 +20,7 @@ Usage:
     python scripts/generate_submission.py                    # recommended default
     python scripts/generate_submission.py --no-semantic      # skip mpnet (faster)
     python scripts/generate_submission.py --no-crossencoder  # skip cross-encoder
-    python scripts/generate_submission.py --llm-rerank       # add Claude Haiku pass
+    python scripts/generate_submission.py --llm-rerank       # add Gemini race-runner pass
     python scripts/generate_submission.py --validate         # validate after run
     python scripts/generate_submission.py --recall-k 2000    # wider BM25 recall
 """
@@ -195,6 +195,34 @@ def score_location(candidate_location: str) -> float:
     return 0.25
 
 
+def _load_ltr_model():
+    import pickle
+    from src.utils.paths import MODELS_DIR
+    ltr_path = MODELS_DIR / "ltr_model.pkl"
+    if not ltr_path.exists():
+        return None, []
+    try:
+        with ltr_path.open("rb") as f:
+            payload = pickle.load(f)
+        print(f"  LTR model loaded from {ltr_path}")
+        return payload["model"], payload["feature_cols"]
+    except Exception as exc:
+        print(f"  LTR model load failed ({exc}) — using hardcoded weights")
+        return None, []
+
+
+def _ltr_rescore(scored: list[dict], ltr_model, feature_cols: list[str]) -> list[dict]:
+    if ltr_model is None or not scored:
+        return scored
+    X = pd.DataFrame(
+        [{col: s.get(col, 0.0) for col in feature_cols} for s in scored]
+    ).fillna(0.0).values
+    ltr_scores = ltr_model.predict(X)
+    for s, score in zip(scored, ltr_scores):
+        s["overall"] = float(score)
+    return sorted(scored, key=lambda x: x["overall"], reverse=True)
+
+
 def score_experience(cand_years: float, min_years: float, max_years: float) -> float:
     """Score candidate years-of-experience against the JD range."""
     if not min_years and not max_years:
@@ -246,6 +274,7 @@ def build_submission(
     *,
     recall_k: int = 2000,
     use_semantic: bool = True,
+    use_dense: bool = True,
     use_cross_encoder: bool = True,
     use_llm_rerank: bool = False,
 ) -> pd.DataFrame:
@@ -294,29 +323,33 @@ def build_submission(
         BM25_INDEX.parent.mkdir(parents=True, exist_ok=True)
         bm25.save(BM25_INDEX)
 
-    dense = DenseRetriever()
-    _dense_meta = DENSE_INDEX.parent / (DENSE_INDEX.name + ".meta.pkl")
-    if _dense_meta.exists():
-        print(f"Loading dense index from {DENSE_INDEX}…")
-        dense.load(DENSE_INDEX)
-    else:
-        if ids is None:
-            print(f"Building candidate documents for dense index…")
-            ids, docs = build_candidate_documents(bundle)
-        print(f"Building dense index ({len(ids):,} candidates) — ~10 min on CPU…")
-        dense.build_index(documents=docs, candidate_ids=ids)
-        DENSE_INDEX.parent.mkdir(parents=True, exist_ok=True)
-        dense.save(DENSE_INDEX)
-
-    retriever = HybridRetriever(bm25_retriever=bm25, dense_retriever=dense)
-
-    # ── Stage 1: Hybrid recall (BM25 + Dense RRF) ───────────────────────────
-    t0 = time.perf_counter()
-    # Only append skill terms that are not already in the job text to avoid double-counting
+    # ── Stage 0b: Dense index (skipped when --no-dense) ─────────────────────
     extra_terms = [s for s in must_skills if s.lower() not in job_text.lower()]
     skill_query = job_text + (" " + " ".join(extra_terms) if extra_terms else "")
-    recall_results = retriever.retrieve(skill_query, top_k=recall_k, recall_k=recall_k)
-    print(f"Hybrid recall: {len(recall_results)} candidates in {(time.perf_counter()-t0)*1000:.0f} ms")
+
+    t0 = time.perf_counter()
+    if use_dense:
+        dense = DenseRetriever()
+        _dense_meta = DENSE_INDEX.parent / (DENSE_INDEX.name + ".meta.pkl")
+        if _dense_meta.exists():
+            print(f"Loading dense index from {DENSE_INDEX}…")
+            dense.load(DENSE_INDEX)
+        else:
+            if ids is None:
+                print("Building candidate documents for dense index…")
+                ids, docs = build_candidate_documents(bundle)
+            print(f"Building dense index ({len(ids):,} candidates) — ~10 min on CPU…")
+            dense.build_index(documents=docs, candidate_ids=ids)
+            DENSE_INDEX.parent.mkdir(parents=True, exist_ok=True)
+            dense.save(DENSE_INDEX)
+
+        retriever = HybridRetriever(bm25_retriever=bm25, dense_retriever=dense)
+        recall_results = retriever.retrieve(skill_query, top_k=recall_k, recall_k=recall_k)
+        print(f"Hybrid recall (BM25+dense): {len(recall_results)} candidates in {(time.perf_counter()-t0)*1000:.0f} ms")
+    else:
+        print("Dense retrieval skipped (--no-dense). Using BM25-only recall…")
+        recall_results = bm25.retrieve(skill_query, top_k=recall_k)
+        print(f"BM25 recall: {len(recall_results)} candidates in {(time.perf_counter()-t0)*1000:.0f} ms")
 
     if not recall_results:
         raise RuntimeError("BM25 recall returned 0 results — rebuild the index.")
@@ -371,6 +404,27 @@ def build_submission(
         skill_score = must_match["composite_score"] * 0.75 + nice_match["composite_score"] * 0.25
 
         exp_score      = score_experience(cand_years, min_years, max_years)
+
+        # Pre-compute behavioral sub-signals for LTR feature vector
+        completeness = _safe_float(row.get("profile_completeness_score")) / 100.0
+        if completeness == 0.0:
+            completeness = _safe_float(row.get("profile_completeness"))
+        response_rate = _safe_float(row.get("recruiter_response_rate"))
+        github_score  = min(_safe_float(row.get("github_activity_score")) / 100.0, 1.0)
+        saved         = min(_safe_float(row.get("saved_by_recruiters_30d")) / 10.0, 1.0)
+        search_app    = min(_safe_float(row.get("search_appearance_30d")) / 500.0, 1.0)
+        assessment    = min(_safe_float(row.get("skill_assessment_avg")) / 100.0, 1.0)
+        open_to_work  = 1.0 if bool(row.get("open_to_work_flag")) else 0.0
+        recency       = 0.4
+        raw_last = _safe_text(row.get("last_active"))
+        if raw_last:
+            try:
+                active_date = datetime.fromisoformat(raw_last[:10]).date()
+                days_since = max((date.today() - active_date).days, 0)
+                recency = max(0.0, 1.0 - days_since / 180.0)
+            except ValueError:
+                pass
+
         beh_score      = score_behavior(row)
         role_score     = score_role_relevance(
             _safe_text(row.get("current_role")),
@@ -420,9 +474,36 @@ def build_submission(
             "missing_skills": list(must_match.get("missing_skills", [])),
             "cand_years":     cand_years,
             "seniority_match": job_seniority == cand_seniority,
+            # LTR feature vector (needed by _ltr_rescore)
+            "must_composite":  must_match.get("composite_score", 0.0),
+            "nice_composite":  nice_match.get("composite_score", 0.0),
+            "must_exact_cov":  must_match.get("exact_coverage", 0.0),
+            "nice_exact_cov":  nice_match.get("exact_coverage", 0.0),
+            "n_must_matched":  must_match.get("n_exact_matched", 0),
+            "n_must_missing":  must_match.get("n_missing", 0),
+            "completeness":    completeness,
+            "response_rate":   response_rate,
+            "recency":         recency,
+            "github_score":    github_score,
+            "saved":           saved,
+            "search_app":      search_app,
+            "assessment":      assessment,
+            "open_to_work":    open_to_work,
         })
 
     scored.sort(key=lambda x: x["overall"], reverse=True)
+
+    # Preserve the 8-signal scores before LTR overrides them — used for the
+    # submitted score column so the values reflect actual signal quality.
+    for s in scored:
+        s["overall_8signal"] = s["overall"]
+
+    # Stage 2b: LTR reranking (when trained model exists)
+    ltr_model, ltr_feature_cols = _load_ltr_model()
+    if ltr_model is not None:
+        print("Applying LTR reranking…")
+        scored = _ltr_rescore(scored, ltr_model, ltr_feature_cols)
+
     top5_roles = [
         _safe_text(lookup.loc[s["candidate_id"]].get("current_role"))
         if s["candidate_id"] in lookup.index else "?"
@@ -488,17 +569,17 @@ def build_submission(
 
     # ── Build submission rows ─────────────────────────────────────────────────
     top = scored[:TOP_K]
-    # After cross-encoder / LLM re-ranking the list order no longer matches
-    # the original overall scores, so naively dividing by top[0]["overall"]
-    # produces non-monotonic scores.  Fix: sort the pool of overall scores
-    # descending and assign the k-th highest score to rank k — the re-ranker
-    # decided *who* belongs at each rank; the score just marks that position.
-    overall_pool = sorted([s["overall"] for s in top], reverse=True)
-    anchor = overall_pool[0] if overall_pool else 1.0
+    # Use the pre-LTR 8-signal scores for the submitted score column.
+    # LTR + cross-encoder determine ORDER; the 8-signal formula provides
+    # interpretable, well-spread score values to assign to each rank position.
+    signal_pool = sorted([s["overall_8signal"] for s in top], reverse=True)
+    anchor = signal_pool[0] if signal_pool else 1.0
 
     rows: list[dict] = []
     for rank, s in enumerate(top, start=1):
-        normalised_score = round(overall_pool[rank - 1] / max(anchor, 1e-9), 6)
+        normalised_score = round(signal_pool[rank - 1] / max(anchor, 1e-9), 6)
+        # Only surface semantic alignment text when an actual semantic model was used
+        sem_score_for_explain = s["sem_norm"] if use_semantic else 0.0
         reasoning = explain_ranking(
             rank=rank,
             job_title=job_title,
@@ -509,7 +590,7 @@ def build_submission(
             job_min_years=min_years,
             seniority_match=s["seniority_match"],
             behavioral_score=s["beh_score"],
-            semantic_score=s["sem_norm"],
+            semantic_score=sem_score_for_explain,
         )
         rows.append({
             "candidate_id": s["candidate_id"],
@@ -531,10 +612,12 @@ def main() -> None:
     parser.add_argument("--recall-k", type=int, default=2000)
     parser.add_argument("--no-semantic", action="store_true",
                         help="Skip semantic similarity scoring (faster, lower quality)")
+    parser.add_argument("--no-dense", action="store_true",
+                        help="Skip dense retrieval — use BM25-only recall (no BGE model needed)")
     parser.add_argument("--no-crossencoder", action="store_true",
                         help="Skip cross-encoder re-ranking")
     parser.add_argument("--llm-rerank", action="store_true",
-                        help="Run LLM listwise re-rank (requires ANTHROPIC_API_KEY)")
+                        help="Run LLM listwise re-rank (requires GOOGLE_API_KEY)")
     parser.add_argument("--validate", action="store_true",
                         help="Validate submission against released candidate pool")
     parser.add_argument("--output", type=Path,
@@ -545,6 +628,7 @@ def main() -> None:
     submission = build_submission(
         recall_k=args.recall_k,
         use_semantic=not args.no_semantic,
+        use_dense=not args.no_dense,
         use_cross_encoder=not args.no_crossencoder,
         use_llm_rerank=args.llm_rerank,
     )

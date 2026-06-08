@@ -42,6 +42,11 @@ mlruns/
 *.parquet
 *.jsonl
 
+# Trained LTR artifacts are small (~19 KB combined) and ship with the repo so
+# `make reproduce` activates LTR reranking on a fresh clone without retraining.
+!outputs/models/ltr_model.pkl
+!outputs/models/ltr_feature_importance.csv
+
 .DS_Store
 Thumbs.db
 

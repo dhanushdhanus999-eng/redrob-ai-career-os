@@ -108,13 +108,26 @@ class DenseRetriever:
     ) -> None:
         self.model_name = model_name
         self.device = device
-        self.encoder = encoder or SentenceTransformerEncoder(model_name=model_name, device=device)
+        self._encoder: EncoderProtocol | None = encoder  # lazily initialised on first use
         self.index_type = index_type
         self.hnsw_m = hnsw_m
         self.ivf_n_lists = ivf_n_lists
         self.ivf_nprobe = ivf_nprobe
         self.index: object | None = None
         self.candidate_ids: list[str] = []
+
+    @property
+    def encoder(self) -> EncoderProtocol:
+        """Load the sentence-transformer encoder on first access (lazy)."""
+        if self._encoder is None:
+            self._encoder = SentenceTransformerEncoder(
+                model_name=self.model_name, device=self.device
+            )
+        return self._encoder
+
+    @encoder.setter
+    def encoder(self, value: EncoderProtocol | None) -> None:
+        self._encoder = value
 
     def build_index(
         self,

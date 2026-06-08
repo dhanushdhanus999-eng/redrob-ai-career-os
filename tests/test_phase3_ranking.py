@@ -27,23 +27,10 @@ class FakeCrossEncoderModel:
         return np.asarray([float("python" in candidate.lower()) for _, candidate in pairs])
 
 
-class FakeMessages:
-    def create(self, **kwargs) -> object:
-        del kwargs
-        return type(
-            "FakeResponse",
-            (),
-            {
-                "content": [
-                    type("FakeText", (), {"text": '{"ranked_ids":["C2","C1"],"reasoning":"C2 matches more."}'})()
-                ]
-            },
-        )()
-
-
-class FakeAnthropicClient:
-    def __init__(self) -> None:
-        self.messages = FakeMessages()
+def fake_race_fn(system_prompt: str, user_prompt: str) -> str:
+    """Stand-in for the Gemini race-runner — returns a canned ranking response."""
+    del system_prompt, user_prompt
+    return '{"ranked_ids":["C2","C1"],"reasoning":"C2 matches more."}'
 
 
 class Phase3RankingTests(unittest.TestCase):
@@ -76,7 +63,7 @@ class Phase3RankingTests(unittest.TestCase):
             cache_dir = Path(tmp_dir)
             candidates = [("C1", "Candidate one"), ("C2", "Candidate two")]
 
-            live = LLMReranker(client=FakeAnthropicClient(), cache_dir=cache_dir)
+            live = LLMReranker(race_fn=fake_race_fn, cache_dir=cache_dir)
             first = live.rerank("Job text", candidates, top_k=2)
             cached = LLMReranker(cache_dir=cache_dir)
             second = cached.rerank("Job text", candidates, top_k=2)
