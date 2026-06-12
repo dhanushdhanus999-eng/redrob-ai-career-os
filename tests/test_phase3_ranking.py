@@ -109,7 +109,12 @@ class Phase3RankingTests(unittest.TestCase):
         )
 
         self.assertIn("rationale", enriched.columns)
-        self.assertIn("Rank #1", enriched.loc[0, "rationale"])
+        rationale = enriched.loc[0, "rationale"]
+        # Reasoning is fact-grounded and non-templated: it should reference a real
+        # matched skill and the candidate's experience, not a fixed "Rank #N" prefix.
+        self.assertIn("Python", rationale)
+        self.assertIn("must-have skills", rationale)
+        self.assertTrue(len(rationale) > 20)
 
 
 if __name__ == "__main__":

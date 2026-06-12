@@ -69,15 +69,29 @@ The repo keeps this stage optional so local smoke tests remain CPU-friendly.
 Production or final-submission runs can enable it once model artifacts and
 runtime budget are available.
 
-### Stage 5: Why LLM Listwise Reranking?
+### Stage 5: LLM Listwise Reranking — Offline Analysis Only
 
 The JD includes qualitative negative criteria such as title-chasing, consulting
 only backgrounds, and weak external validation. An LLM listwise pass can reason
 over the final shortlist when structured features are too blunt.
 
-This stage is deliberately cached and optional. It should be used only for the
-last 30 to 100 candidates so cost, latency, and reproducibility remain under
-control.
+**This stage is NOT part of the submitted ranking.** The competition's Stage-3
+reproduction runs with the network OFF and forbids hosted-LLM calls
+(submission_spec §3), and a per-candidate LLM pass cannot meet the 5-minute CPU
+budget in production. We therefore use it only as an *offline* cross-check while
+developing the structured signals — never to produce `submission.csv`. The
+qualitative criteria it inspired (title-chasing, consulting penalties) are instead
+encoded directly into the network-free `role_relevance` and `consistency` scorers.
+
+### Stage 6: Internal-Consistency / Honeypot Filter
+
+The dataset contains ~80 honeypot profiles with internally impossible data (e.g.
+"expert" proficiency in skills with 0 months of use). They are forced to tier 0
+in the ground truth, and a >10% honeypot rate in the top 100 is an automatic
+Stage-3 disqualification. `src/utils/consistency.py` reads each profile's
+structured skill timeline and total experience, flags these contradictions, and
+hard-caps detected honeypots out of the shortlist. This is a pure-Python,
+network-free check that runs inside the ranking budget.
 
 ## 3. Feature Engineering Details
 

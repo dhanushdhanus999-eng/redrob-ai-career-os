@@ -3,26 +3,32 @@
 Pipeline stages:
   Stage 0: Load BM25 index (built from 100K candidate pool)
   Stage 1: BM25 recall — top recall_k candidates
-  Stage 1b: Semantic similarity scoring (all-mpnet-base-v2, optional)
-  Stage 2: Multi-signal scoring:
-             BM25 norm  × 0.15
-             Semantic   × 0.18  (if model available, else redistributed)
-             Skill match× 0.22  (expanded ontology — 60+ synonyms, 13 families)
-             Role score × 0.13  (AI Engineer → 1.0, HR Manager → 0.1)
-             Exp fit    × 0.10
-             Behavioral × 0.10
-             Career     × 0.07  (consulting-firm penalty baked in)
+  Stage 1b: Semantic similarity scoring (BGE-large-en-v1.5, optional)
+  Stage 2: Multi-signal scoring (9 signals, sums to 1.0):
+             BM25 norm   × 0.13
+             Semantic    × 0.18  (if model available, else redistributed)
+             Skill match × 0.18  (expanded ontology — 60+ synonyms, 13 families)
+             Role score  × 0.12  (AI Engineer → 1.0, HR Manager → 0.1)
+             Exp fit     × 0.10
+             Behavioral  × 0.08
+             Career      × 0.12  (production-evidence; consulting penalty baked in)
+             Location    × 0.04
+             Consistency × 0.05  (honeypots hard-capped — Stage-3 DQ guard)
+  Stage 2b: LTR blend (opt-in --ltr; 40% minority signal, partially circular)
   Stage 3: Cross-encoder re-rank of top 50 (optional)
-  Stage 4: LLM listwise re-rank of top 30 (optional, --llm-rerank)
+  Stage 4: LLM listwise re-rank — OFFLINE ONLY, forbidden for the submission
   Output:  100-row CSV: candidate_id, rank, score, reasoning
 
+NOTE: the canonical, network-free, ≤5-minute submission entrypoint is `rank.py`
+at the repo root. This script is the richer research/analysis pipeline.
+
 Usage:
-    python scripts/generate_submission.py                    # recommended default
-    python scripts/generate_submission.py --no-semantic      # skip mpnet (faster)
+    python scripts/generate_submission.py                    # full research pipeline
+    python scripts/generate_submission.py --no-semantic      # skip BGE (faster)
     python scripts/generate_submission.py --no-crossencoder  # skip cross-encoder
-    python scripts/generate_submission.py --llm-rerank       # add Gemini race-runner pass
+    python scripts/generate_submission.py --ltr              # blend LTR (off by default)
     python scripts/generate_submission.py --validate         # validate after run
-    python scripts/generate_submission.py --recall-k 2000    # wider BM25 recall
+    python scripts/generate_submission.py --recall-k 2000    # wider recall
 """
 from __future__ import annotations
 
@@ -54,6 +60,7 @@ from src.ranking.explainer import explain_ranking
 from src.retrieval.bm25_retriever import BM25Retriever
 from src.retrieval.dense_retriever import DenseRetriever
 from src.retrieval.hybrid_retriever import HybridRetriever
+from src.utils.consistency import score_consistency
 from src.utils.paths import MODELS_DIR, SUBMISSIONS_DIR, ensure_project_dirs
 from src.utils.role_relevance import score_career_trajectory, score_role_relevance
 from src.utils.skill_ontology import SkillMatcher
@@ -63,63 +70,18 @@ DENSE_INDEX = MODELS_DIR / "dense_demo_index"
 TOP_K = 100
 
 
-# ── Track 1 JD — hardcoded must-have and nice-to-have skills ────────────────
-# Extracted directly from the DOCX job description for precision.
-# The JD parser's rule-based extraction misses most of these due to prose format.
-
-TRACK1_MUST_HAVE_SKILLS: list[str] = [
-    "Python",
-    "Embeddings",
-    "Sentence Transformers",
-    "BGE Embeddings",
-    "E5 Embeddings",
-    "OpenAI Embeddings",
-    "Vector Databases",
-    "Qdrant",
-    "Pinecone",
-    "Weaviate",
-    "Milvus",
-    "FAISS",
-    "OpenSearch",
-    "Elasticsearch",
-    "Hybrid Search",
-    "Dense Retrieval",
-    "Semantic Search",
-    "NDCG",
-    "MRR",
-    "MAP",
-    "A/B Testing",
-    "Retrieval Augmented Generation",
-    "Large Language Models",
-    "Ranking",
-    "Reranking",
-]
-
-TRACK1_NICE_TO_HAVE_SKILLS: list[str] = [
-    "LoRA",
-    "QLoRA",
-    "PEFT",
-    "Fine-Tuning",
-    "Learning to Rank",
-    "LambdaRank",
-    "LightGBM",
-    "XGBoost",
-    "LangChain",
-    "LlamaIndex",
-    "MLflow",
-    "Kubeflow",
-    "FastAPI",
-    "Distributed Systems",
-    "Hugging Face",
-    "PyTorch",
-    "Anthropic SDK",
-    "Open Source",
-]
-
-TRACK1_MIN_YEARS = 5.0
-TRACK1_MAX_YEARS = 9.0
-TRACK1_JOB_TITLE = "Senior AI Engineer - Founding Team"
-TRACK1_JOB_SENIORITY = "senior"
+# ── Track 1 JD constants — shared, dependency-free source of truth ──────────
+# Extracted directly from the DOCX job description for precision (the rule-based
+# parser misses most skills due to the prose format). Defined in
+# src/utils/track1_spec.py so rank.py can reuse them without import cost.
+from src.utils.track1_spec import (  # noqa: E402
+    TRACK1_JOB_SENIORITY,
+    TRACK1_JOB_TITLE,
+    TRACK1_MAX_YEARS,
+    TRACK1_MIN_YEARS,
+    TRACK1_MUST_HAVE_SKILLS,
+    TRACK1_NICE_TO_HAVE_SKILLS,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -211,15 +173,38 @@ def _load_ltr_model():
         return None, []
 
 
-def _ltr_rescore(scored: list[dict], ltr_model, feature_cols: list[str]) -> list[dict]:
+def _ltr_rescore(
+    scored: list[dict],
+    ltr_model,
+    feature_cols: list[str],
+    *,
+    blend: float = 0.4,
+) -> list[dict]:
+    """Blend LTR predictions with the hand-tuned 8-signal formula.
+
+    The LTR model is trained on *pseudo*-labels derived from role/experience
+    signals that are also its own features, so it is partially circular (see
+    docs/ablation.md). We therefore *blend* rather than override: the interpretable
+    formula stays the ranker of record (weight ``1 - blend``) and LTR contributes
+    a minority signal (weight ``blend``). Both are min-max normalised across the
+    recall set before mixing so the scales are comparable.
+    """
     if ltr_model is None or not scored:
         return scored
     X = pd.DataFrame(
         [{col: s.get(col, 0.0) for col in feature_cols} for s in scored]
     ).fillna(0.0).values
-    ltr_scores = ltr_model.predict(X)
-    for s, score in zip(scored, ltr_scores):
-        s["overall"] = float(score)
+    ltr_scores = np.asarray(ltr_model.predict(X), dtype=float)
+
+    lo, hi = float(ltr_scores.min()), float(ltr_scores.max())
+    ltr_norm = (ltr_scores - lo) / (hi - lo) if hi > lo else np.full(len(ltr_scores), 0.5)
+
+    formula = np.asarray([s["overall"] for s in scored], dtype=float)
+    f_lo, f_hi = float(formula.min()), float(formula.max())
+    formula_norm = (formula - f_lo) / (f_hi - f_lo) if f_hi > f_lo else np.full(len(formula), 0.5)
+
+    for s, fn, ln in zip(scored, formula_norm, ltr_norm):
+        s["overall"] = float((1.0 - blend) * fn + blend * ln)
     return sorted(scored, key=lambda x: x["overall"], reverse=True)
 
 
@@ -276,6 +261,7 @@ def build_submission(
     use_semantic: bool = True,
     use_dense: bool = True,
     use_cross_encoder: bool = True,
+    use_ltr: bool = False,
     use_llm_rerank: bool = False,
 ) -> pd.DataFrame:
     ensure_project_dirs()
@@ -433,31 +419,51 @@ def build_submission(
         career_score   = score_career_trajectory(_safe_text(row.get("career_history_text")))
         location_score = score_location(cand_location)
 
-        # Weighted formula — 8 signals, sums to 1.0
-        # retrieval: 0.15, semantic: 0.18, skill: 0.22, role: 0.13,
-        # exp: 0.10, behavioral: 0.10, career: 0.07, location: 0.05
+        # Internal-consistency / honeypot check (see src/utils/consistency.py).
+        # Honeypots are forced to tier 0 in the hidden ground truth and a >10%
+        # honeypot rate in the top 100 is an automatic Stage-3 disqualification.
+        consistency = score_consistency(
+            _safe_text(row.get("skills_detailed")), cand_years
+        )
+
+        # Weighted formula — 9 signals, sums to 1.0. Re-balanced away from raw
+        # keyword/skill matching (which the JD explicitly calls a trap) toward
+        # production-evidence (career trajectory) and profile plausibility.
+        # retrieval 0.13, semantic 0.18, skill 0.18, role 0.12, exp 0.10,
+        # behavioral 0.08, career 0.12, location 0.04, consistency 0.05
         if use_semantic:
             overall = (
-                0.15 * retrieval_norm
+                0.13 * retrieval_norm
                 + 0.18 * sem_norm
-                + 0.22 * skill_score
-                + 0.13 * role_score
+                + 0.18 * skill_score
+                + 0.12 * role_score
                 + 0.10 * exp_score
-                + 0.10 * beh_score
-                + 0.07 * career_score
-                + 0.05 * location_score
+                + 0.08 * beh_score
+                + 0.12 * career_score
+                + 0.04 * location_score
+                + 0.05 * consistency.consistency_score
             )
         else:
             # Redistribute semantic weight when model unavailable
             overall = (
-                0.23 * retrieval_norm
-                + 0.27 * skill_score
-                + 0.15 * role_score
-                + 0.12 * exp_score
-                + 0.11 * beh_score
-                + 0.07 * career_score
-                + 0.05 * location_score
+                0.18 * retrieval_norm
+                + 0.24 * skill_score
+                + 0.13 * role_score
+                + 0.11 * exp_score
+                + 0.09 * beh_score
+                + 0.16 * career_score
+                + 0.04 * location_score
+                + 0.05 * consistency.consistency_score
             )
+
+        # Hard cap: a detected honeypot cannot reach the shortlist regardless of
+        # how many keywords it stuffs into the profile.
+        if consistency.is_honeypot:
+            overall *= 0.05
+
+        nice_matched = sorted(
+            set(nice_match.get("matched_skills", [])) | (set(must_match.get("matched_skills", [])) & set(nice_skills))
+        )
 
         scored.append({
             "candidate_id":   str(cid),
@@ -469,10 +475,16 @@ def build_submission(
             "role_score":     role_score,
             "career_score":   career_score,
             "location_score": location_score,
+            "consistency_score": consistency.consistency_score,
+            "is_honeypot":    consistency.is_honeypot,
             "overall":        overall,
             "matched_skills": list(must_match.get("matched_skills", [])),
+            "matched_nice":   nice_matched,
             "missing_skills": list(must_match.get("missing_skills", [])),
             "cand_years":     cand_years,
+            "current_title":  _safe_text(row.get("current_role")),
+            "location":       cand_location,
+            "notice_period":  _safe_float(row.get("notice_period_days")),
             "seniority_match": job_seniority == cand_seniority,
             # LTR feature vector (needed by _ltr_rescore)
             "must_composite":  must_match.get("composite_score", 0.0),
@@ -498,11 +510,14 @@ def build_submission(
     for s in scored:
         s["overall_8signal"] = s["overall"]
 
-    # Stage 2b: LTR reranking (when trained model exists)
-    ltr_model, ltr_feature_cols = _load_ltr_model()
-    if ltr_model is not None:
-        print("Applying LTR reranking…")
-        scored = _ltr_rescore(scored, ltr_model, ltr_feature_cols)
+    # Stage 2b: LTR reranking (opt-in blend; off by default)
+    # The pseudo-label LTR model is partially circular, so it is NOT the ranker
+    # of record. With --ltr it contributes a minority (40%) blended signal.
+    if use_ltr:
+        ltr_model, ltr_feature_cols = _load_ltr_model()
+        if ltr_model is not None:
+            print("Blending LTR predictions (40%) with the 8-signal formula…")
+            scored = _ltr_rescore(scored, ltr_model, ltr_feature_cols, blend=0.4)
 
     top5_roles = [
         _safe_text(lookup.loc[s["candidate_id"]].get("current_role"))
@@ -510,6 +525,9 @@ def build_submission(
         for s in scored[:5]
     ]
     print(f"Top-5 roles after Stage 2: {top5_roles}")
+    honeypots_in_top100 = sum(1 for s in scored[:TOP_K] if s.get("is_honeypot"))
+    print(f"Honeypots detected in recall set: {sum(1 for s in scored if s.get('is_honeypot'))} "
+          f"| in top {TOP_K}: {honeypots_in_top100}")
 
     # ── Stage 3: Cross-encoder re-rank of top 50 ─────────────────────────────
     if use_cross_encoder:
@@ -539,7 +557,13 @@ def build_submission(
             print(f"  Cross-encoder skipped ({exc})")
 
     # ── Stage 4: LLM listwise re-rank of top 30 ──────────────────────────────
+    # WARNING: this calls a hosted LLM (network). The competition's Stage-3
+    # reproduction runs with the network OFF, so this MUST NOT be used to produce
+    # the submitted CSV — it exists only for offline analysis/comparison. The
+    # canonical, network-free submission entrypoint is `rank.py`.
     if use_llm_rerank:
+        print("WARNING: --llm-rerank makes network calls and is FORBIDDEN for the")
+        print("         official submission (Stage-3 runs with no network). Use only offline.")
         print("LLM listwise re-ranking top 30 (Gemini race-runner)…")
         try:
             from src.ranking.llm_reranker import LLMReranker
@@ -588,9 +612,18 @@ def build_submission(
             candidate_skills=s["matched_skills"] + s["missing_skills"],
             cand_years_exp=s["cand_years"],
             job_min_years=min_years,
+            job_max_years=max_years,
             seniority_match=s["seniority_match"],
             behavioral_score=s["beh_score"],
             semantic_score=sem_score_for_explain,
+            current_title=s.get("current_title", ""),
+            location=s.get("location", ""),
+            matched_must=s["matched_skills"],
+            matched_nice=s.get("matched_nice", []),
+            response_rate=s.get("response_rate"),
+            github_score=s.get("github_score", 0.0),
+            open_to_work=bool(s.get("open_to_work")),
+            notice_period_days=int(s["notice_period"]) if s.get("notice_period") else None,
         )
         rows.append({
             "candidate_id": s["candidate_id"],
@@ -616,8 +649,10 @@ def main() -> None:
                         help="Skip dense retrieval — use BM25-only recall (no BGE model needed)")
     parser.add_argument("--no-crossencoder", action="store_true",
                         help="Skip cross-encoder re-ranking")
+    parser.add_argument("--ltr", action="store_true",
+                        help="Blend the (partially circular) pseudo-label LTR model at 40%% (off by default)")
     parser.add_argument("--llm-rerank", action="store_true",
-                        help="Run LLM listwise re-rank (requires GOOGLE_API_KEY)")
+                        help="OFFLINE ONLY — network LLM re-rank, forbidden for the official submission")
     parser.add_argument("--validate", action="store_true",
                         help="Validate submission against released candidate pool")
     parser.add_argument("--output", type=Path,
@@ -630,6 +665,7 @@ def main() -> None:
         use_semantic=not args.no_semantic,
         use_dense=not args.no_dense,
         use_cross_encoder=not args.no_crossencoder,
+        use_ltr=args.ltr,
         use_llm_rerank=args.llm_rerank,
     )
     elapsed = time.perf_counter() - t_total

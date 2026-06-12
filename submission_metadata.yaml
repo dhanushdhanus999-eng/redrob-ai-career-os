@@ -1,0 +1,52 @@
+# India Runs Track 1 — Submission Metadata
+# Mirrors the portal metadata collected at upload (submission_spec §10.2).
+# Fill in every <PLACEHOLDER> before submitting. The CSV filename you upload
+# MUST be your registered participant ID, e.g. team_xxx.csv.
+
+team_name: "<YOUR_TEAM_NAME>"
+
+primary_contact:
+  name: "<YOUR_NAME>"
+  email: "<YOUR_EMAIL>"
+  phone: "<YOUR_PHONE>"
+
+team_members:
+  - name: "<YOUR_NAME>"
+    email: "<YOUR_EMAIL>"
+
+github_repository_url: "https://github.com/<USERNAME>/<REPO>"
+
+# A working hosted environment where the ranking system can be run on a small
+# sample (HuggingFace Spaces / Streamlit Cloud / Replit / Colab / Docker / Binder).
+# REQUIRED — the submission is rejected without it. Deploy app/demo.py.
+sandbox_demo_link: "<YOUR_HOSTED_DEMO_URL>"
+
+# Honest declaration (not penalised). Multi-select from:
+# Claude / ChatGPT / Copilot / Cursor / Gemini / Other / None
+ai_tools_declared:
+  - "Claude"
+
+compute_environment_summary: >-
+  Windows 11, 16 GB RAM, Python 3.13, CPU-only. The ranking step (rank.py) runs
+  network-free in ~100 s wall-clock, well within the 5-minute / 16 GB / no-GPU /
+  no-network Stage-3 constraints. Index tokenisation is a one-off pre-computation.
+
+# Optional but strongly recommended (<=200 words). Helps Stage 4 review.
+methodology_summary: >-
+  A multi-stage, network-free ranker for the Senior AI Engineer JD over 100K
+  candidates. Stage 1 is BM25 lexical recall (precomputed index) to ~1.5K
+  candidates. Stage 2 scores each with nine interpretable signals: skill-ontology
+  match (must + nice), semantic/lexical relevance, role relevance (hard-caps
+  HR/non-technical honeypot titles), experience fit to the 5-9 year band, career
+  trajectory (rewards production-ML evidence, penalises consulting-only and
+  title-chasing), behavioural Redrob signals, India/Pune-Noida location fit, and
+  an internal-consistency check that detects the ~80 honeypots with impossible
+  profiles (e.g. "expert" skills with 0 months used) and forces them out of the
+  shortlist. Weights are deliberately tilted away from raw keyword matching, which
+  the JD calls a trap. The whole ranking step is CPU-only with no LLM/network
+  call; per-candidate reasoning is generated deterministically from real profile
+  facts, including honest concerns. Reproduce: `python rank.py --candidates
+  candidates.jsonl --out submission.csv`.
+
+# The single command that reproduces the submission CSV from the candidates file.
+reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
