@@ -19,7 +19,7 @@ github_repository_url: "https://github.com/<USERNAME>/<REPO>"
 # A working hosted environment where the ranking system can be run on a small
 # sample (HuggingFace Spaces / Streamlit Cloud / Replit / Colab / Docker / Binder).
 # REQUIRED — the submission is rejected without it. Deploy app/demo.py.
-sandbox_demo_link: "<YOUR_HOSTED_DEMO_URL>"
+sandbox_demo_link: "https://huggingface.co/spaces/Dhanush9145/india-runs-ranking"
 
 # Honest declaration (not penalised). Multi-select from:
 # Claude / ChatGPT / Copilot / Cursor / Gemini / Other / None

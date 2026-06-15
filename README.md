@@ -6,7 +6,7 @@ hybrid BM25 + dense retrieval, 30+ fit features, behavioral activity signals,
 reranking stages, and per-candidate natural-language explanations.
 
 **Reproduce the submission:** `python rank.py --candidates ./candidates.jsonl --out ./submission.csv`  
-**Live sandbox:** deploy `app/demo.py` — see [`docs/HUGGINGFACE_DEPLOY.md`](docs/HUGGINGFACE_DEPLOY.md) *(required at submission; paste URL into [`submission_metadata.yaml`](submission_metadata.yaml))*  
+**Live sandbox:** [huggingface.co/spaces/Dhanush9145/india-runs-ranking](https://huggingface.co/spaces/Dhanush9145/india-runs-ranking) — deploy notes in [`docs/HUGGINGFACE_DEPLOY.md`](docs/HUGGINGFACE_DEPLOY.md)  
 **Video:** Recording script at [`docs/DEMO_VIDEO_SCRIPT.md`](docs/DEMO_VIDEO_SCRIPT.md)  
 **Dataset:** Official India Runs public bundle, normalised into `data/processed/`  
 **Challenge shape:** One Senior AI Engineer JD · 100,000 candidates · hidden evaluation

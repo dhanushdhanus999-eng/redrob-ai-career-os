@@ -1,8 +1,8 @@
 ---
 title: India Runs - Intelligent Candidate Discovery
-emoji: IN
+emoji: 🔍
 colorFrom: blue
-colorTo: orange
+colorTo: purple
 sdk: gradio
 sdk_version: 5.50.0
 app_file: app.py
