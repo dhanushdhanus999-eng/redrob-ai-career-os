@@ -419,33 +419,51 @@ button.primary:active { transform: translateY(0) scale(0.98) !important; }
     overflow: hidden !important;
     border: 1px solid rgba(59,130,246,0.14) !important;
 }
-table { background: rgba(5,12,28,0.55) !important; }
 
-thead tr { background: rgba(59,130,246,0.09) !important; }
+/* Override Gradio's default LIGHT table fills — otherwise cells render white
+   and the light text becomes unreadable. */
+.gradio-container, .table-wrap, table {
+    --table-even-background-fill: #0a1326 !important;
+    --table-odd-background-fill:  #060f20 !important;
+    --table-row-focus:            rgba(59,130,246,0.14) !important;
+    --table-border-color:         rgba(59,130,246,0.16) !important;
+    --border-color-primary:       rgba(59,130,246,0.16) !important;
+}
+
+table { background: #060f20 !important; color: var(--ir-text) !important; }
+
+thead tr { background: rgba(59,130,246,0.12) !important; }
 thead th {
     color: var(--ir-blue-l) !important;
     font-size: 11px !important;
     font-weight: 600 !important;
     letter-spacing: 0.10em !important;
     text-transform: uppercase !important;
-    border-bottom: 1px solid rgba(59,130,246,0.18) !important;
+    border-bottom: 1px solid rgba(59,130,246,0.22) !important;
     padding: 12px 10px !important;
     white-space: nowrap !important;
 }
 
 tbody tr {
-    border-bottom: 1px solid rgba(255,255,255,0.03) !important;
+    background: #0a1326 !important;
+    border-bottom: 1px solid rgba(255,255,255,0.05) !important;
     transition: background 0.18s !important;
 }
-tbody tr:hover { background: rgba(59,130,246,0.07) !important; }
+tbody tr:nth-child(even) { background: #060f20 !important; }
+tbody tr:hover { background: rgba(59,130,246,0.12) !important; }
 
 tbody td {
+    background: transparent !important;
     color: var(--ir-text) !important;
     font-size: 12px !important;
     padding: 10px 10px !important;
     border: none !important;
 }
-tbody td:first-child {
+/* Gradio wraps cell content in inner spans/divs — force their colour too */
+tbody td, tbody td *, tbody td span, tbody td .cell-wrap, tbody td .cell-wrap span {
+    color: var(--ir-text) !important;
+}
+tbody td:first-child, tbody td:first-child * {
     color: var(--ir-gold) !important;
     font-weight: 700 !important;
     font-family: 'Space Grotesk', sans-serif !important;
