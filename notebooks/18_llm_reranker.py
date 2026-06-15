@@ -30,7 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--submission", default=str(SUBMISSIONS_DIR / "cross_encoder_val.csv"))
     parser.add_argument("--output-name", default="llm_rerank_val")
-    parser.add_argument("--model-name", default="claude-haiku-4-5-20251001")
+    parser.add_argument("--model-name", default=None,
+                        help="Ollama model tag; defaults to OLLAMA_MODEL or qwen2.5:7b")
     parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--sample-jobs", type=int, default=5)
     return parser.parse_args()
@@ -72,7 +73,7 @@ def main() -> None:
     )
     print(f"Saved LLM reranked submission to: {output_path}")
     if not reranker.enabled:
-        print("No Anthropic client available; output preserves the incoming ranking order.")
+        print("Ollama server not reachable; output preserves the incoming ranking order.")
 
     if reranked_predictions:
         ground_truth = labels_to_ground_truth(val_df)

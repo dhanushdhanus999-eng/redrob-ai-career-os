@@ -1,17 +1,26 @@
-"""LLM listwise reranking with Gemini race-runner, disk caching, and graceful fallback.
+"""LLM listwise reranking via a local Ollama server, with disk caching and fallback.
 
-Three Gemini models are called simultaneously; whichever responds first is used
-and the others are cancelled. This eliminates single-model rate-spike failures.
+A single local model served by Ollama (default ``qwen2.5:7b``) is called over HTTP to
+rerank the final shortlist. No hosted-LLM provider (Gemini / OpenAI / Anthropic) is used
+anywhere — the only LLM dependency is the local Ollama host.
 
-Race order: gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.5-pro
+Note on competition compliance: this still issues a network request to the Ollama host,
+so — exactly like the previous hosted-LLM version — it remains OFFLINE-RESEARCH-ONLY and is
+never part of the network-free `rank.py` submission path.
+
+Configuration (env, both optional):
+- ``OLLAMA_BASE_URL``  default ``http://100.96.26.32:11434``
+- ``OLLAMA_MODEL``     default ``qwen2.5:7b``   (alternatives on the host: ``qwen3.5:9b``,
+                       ``llama3:8b``, ``mistral:latest``, ``deepseek-coder-v2:latest`` …)
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Callable
 
@@ -20,11 +29,8 @@ from src.utils.paths import CACHE_DIR
 
 LLM_CACHE_DIR = CACHE_DIR / "llm_rerank"
 
-_RACE_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
-]
+DEFAULT_OLLAMA_BASE_URL = "http://100.96.26.32:11434"
+DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are a senior AI engineering recruiter evaluating candidates for the role of
@@ -78,91 +84,99 @@ def _cache_key(job_text: str, candidate_ids: list[str]) -> str:
     return hashlib.md5(content.encode("utf-8")).hexdigest()
 
 
-# ── Gemini async helpers ──────────────────────────────────────────────────────
+# ── Ollama HTTP helpers ───────────────────────────────────────────────────────
 
-async def _call_gemini(model_name: str, system_prompt: str, user_prompt: str) -> str:
-    """Call one Gemini model asynchronously and return the text response."""
-    import google.generativeai as genai  # imported lazily
+def _call_ollama(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    base_url: str,
+    timeout: float,
+) -> str:
+    """Call one local Ollama chat model and return the text response.
 
-    model = genai.GenerativeModel(
-        model_name,
-        system_instruction=system_prompt,
+    Uses ``format: "json"`` and ``temperature: 0`` so the model returns a single
+    deterministic JSON object suitable for parsing downstream.
+    """
+    url = base_url.rstrip("/") + "/api/chat"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    response = await model.generate_content_async(user_prompt)
-    return response.text
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload["message"]["content"]
 
 
-async def _race_gemini(system_prompt: str, user_prompt: str) -> str:
-    """Race three Gemini models; return the first successful response."""
-    tasks = [
-        asyncio.create_task(_call_gemini(name, system_prompt, user_prompt))
-        for name in _RACE_MODELS
-    ]
+def _ollama_available(base_url: str, *, timeout: float = 3.0) -> bool:
+    """Return True if the Ollama server answers ``/api/tags`` quickly."""
+    url = base_url.rstrip("/") + "/api/tags"
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        return next(iter(done)).result()
-    except Exception:
-        # Cancel all remaining tasks on any error
-        for task in tasks:
-            task.cancel()
-        raise
-
-
-def _run_race(system_prompt: str, user_prompt: str) -> str:
-    """Synchronous wrapper — runs the async race in a new event loop."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Inside an existing loop (e.g. Jupyter / Gradio): use nest_asyncio
-            import nest_asyncio  # optional dep
-            nest_asyncio.apply()
-            return loop.run_until_complete(_race_gemini(system_prompt, user_prompt))
-        return loop.run_until_complete(_race_gemini(system_prompt, user_prompt))
-    except RuntimeError:
-        return asyncio.run(_race_gemini(system_prompt, user_prompt))
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
 
 class LLMReranker:
-    """Use a cached Gemini LLM call to rerank the final shortlist when available."""
+    """Rerank the final shortlist with a cached local-Ollama LLM call when available."""
 
     def __init__(
         self,
         *,
-        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
         cache_dir: Path | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-        race_fn: Callable[[str, str], str] | None = None,
+        call_fn: Callable[[str, str], str] | None = None,
+        timeout: float = 120.0,
     ) -> None:
-        """``race_fn`` overrides the Gemini race-runner — used to inject a fake
-        model call in tests or to swap in an alternative LLM provider without
-        touching the caching/normalisation logic."""
+        """``call_fn`` overrides the Ollama call — used to inject a fake model
+        response in tests without touching the caching/normalisation logic."""
         self.system_prompt = system_prompt
         self.cache_dir = cache_dir or LLM_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._race_fn = race_fn or _run_race
-
-        if race_fn is not None:
-            self._ready = True
-            return
-
-        api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        if api_key:
-            try:
-                import google.generativeai as genai
-                genai.configure(api_key=api_key)
-                self._ready = True
-            except ImportError:
-                self._ready = False
-        else:
-            self._ready = False
+        self.model = model or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+        self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)
+        self.timeout = timeout
+        self._call_fn = call_fn
+        # Health check is lazy (see ``enabled``) so construction never blocks on
+        # the network — the cache-hit path returns without ever reaching Ollama.
+        self._ready: bool | None = True if call_fn is not None else None
 
     @property
     def enabled(self) -> bool:
+        if self._call_fn is not None:
+            return True
+        if self._ready is None:
+            self._ready = _ollama_available(self.base_url)
         return self._ready
+
+    def _call(self, system_prompt: str, user_prompt: str) -> str:
+        if self._call_fn is not None:
+            return self._call_fn(system_prompt, user_prompt)
+        return _call_ollama(
+            self.model,
+            system_prompt,
+            user_prompt,
+            base_url=self.base_url,
+            timeout=self.timeout,
+        )
 
     def _cache_path(self, job_text: str, candidate_ids: list[str]) -> Path:
         return self.cache_dir / f"{_cache_key(job_text, candidate_ids)}.json"
@@ -188,7 +202,7 @@ class LLMReranker:
         *,
         top_k: int = 30,
     ) -> list[tuple[str, str]]:
-        """Return reranked (candidate_id, reasoning) pairs using the Gemini race-runner."""
+        """Return reranked (candidate_id, reasoning) pairs using the local Ollama model."""
         candidates = list(candidates[:top_k])
         if not candidates:
             return []
@@ -221,7 +235,7 @@ class LLMReranker:
         )
 
         try:
-            raw_text = self._race_fn(self.system_prompt, user_prompt).strip()
+            raw_text = self._call(self.system_prompt, user_prompt).strip()
             cleaned = raw_text.replace("```json", "").replace("```", "").strip()
             payload = json.loads(cleaned)
         except Exception:

@@ -45,7 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cross-encoder-top-n", type=int, default=100)
     parser.add_argument("--cross-encoder-top-k", type=int, default=50)
     parser.add_argument("--run-llm", action="store_true")
-    parser.add_argument("--llm-model", default="claude-haiku-4-5-20251001")
+    parser.add_argument("--llm-model", default=None,
+                        help="Ollama model tag; defaults to OLLAMA_MODEL or qwen2.5:7b")
     parser.add_argument("--llm-top-k", type=int, default=30)
     parser.add_argument("--refresh-parsed", action="store_true")
     return parser.parse_args()

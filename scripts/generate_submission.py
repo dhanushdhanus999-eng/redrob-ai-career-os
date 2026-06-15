@@ -557,19 +557,19 @@ def build_submission(
             print(f"  Cross-encoder skipped ({exc})")
 
     # ── Stage 4: LLM listwise re-rank of top 30 ──────────────────────────────
-    # WARNING: this calls a hosted LLM (network). The competition's Stage-3
-    # reproduction runs with the network OFF, so this MUST NOT be used to produce
-    # the submitted CSV — it exists only for offline analysis/comparison. The
-    # canonical, network-free submission entrypoint is `rank.py`.
+    # WARNING: this calls the local Ollama server (network). The competition's
+    # Stage-3 reproduction runs with the network OFF, so this MUST NOT be used to
+    # produce the submitted CSV — it exists only for offline analysis/comparison.
+    # The canonical, network-free submission entrypoint is `rank.py`.
     if use_llm_rerank:
         print("WARNING: --llm-rerank makes network calls and is FORBIDDEN for the")
         print("         official submission (Stage-3 runs with no network). Use only offline.")
-        print("LLM listwise re-ranking top 30 (Gemini race-runner)…")
+        print("LLM listwise re-ranking top 30 (local Ollama)…")
         try:
             from src.ranking.llm_reranker import LLMReranker
             reranker = LLMReranker()
             if not reranker.enabled:
-                print("  GOOGLE_API_KEY not set — skipping LLM re-rank.")
+                print("  Ollama server not reachable — skipping LLM re-rank.")
             else:
                 top30_pairs: list[tuple[str, str]] = []
                 for s in scored[:30]:

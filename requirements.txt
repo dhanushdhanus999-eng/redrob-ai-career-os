@@ -30,7 +30,6 @@ tqdm==4.67.1
 transformers==4.52.4
 wandb==0.20.1
 
-# LLM re-ranking (optional — needed for --llm-rerank flag)
-# google-generativeai>=0.8.0
-# anthropic==0.54.0
-# openai==1.82.0
+# LLM re-ranking (optional — needed for --llm-rerank flag) uses a LOCAL Ollama
+# server over plain HTTP (Python stdlib urllib). No extra package is required;
+# just run `ollama serve` and pull a model, e.g. `ollama pull qwen2.5:7b`.

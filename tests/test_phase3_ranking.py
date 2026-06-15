@@ -27,8 +27,8 @@ class FakeCrossEncoderModel:
         return np.asarray([float("python" in candidate.lower()) for _, candidate in pairs])
 
 
-def fake_race_fn(system_prompt: str, user_prompt: str) -> str:
-    """Stand-in for the Gemini race-runner — returns a canned ranking response."""
+def fake_call_fn(system_prompt: str, user_prompt: str) -> str:
+    """Stand-in for the Ollama call — returns a canned ranking response."""
     del system_prompt, user_prompt
     return '{"ranked_ids":["C2","C1"],"reasoning":"C2 matches more."}'
 
@@ -63,7 +63,7 @@ class Phase3RankingTests(unittest.TestCase):
             cache_dir = Path(tmp_dir)
             candidates = [("C1", "Candidate one"), ("C2", "Candidate two")]
 
-            live = LLMReranker(race_fn=fake_race_fn, cache_dir=cache_dir)
+            live = LLMReranker(call_fn=fake_call_fn, cache_dir=cache_dir)
             first = live.rerank("Job text", candidates, top_k=2)
             cached = LLMReranker(cache_dir=cache_dir)
             second = cached.rerank("Job text", candidates, top_k=2)

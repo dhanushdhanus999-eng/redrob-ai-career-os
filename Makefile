@@ -51,7 +51,7 @@ reproduce:
 # ── Final submission (with optional LLM re-rank) ──────────────────────────────
 submit:
 	@echo "==> Generating final submission (LLM re-rank enabled)"
-	@echo "    Requires GOOGLE_API_KEY in environment or .env"
+	@echo "    Requires a local Ollama server (OLLAMA_BASE_URL / OLLAMA_MODEL in .env)"
 	python scripts/generate_submission.py --llm-rerank --validate
 	@echo ""
 	@echo "Upload outputs/submissions/final_submission.csv to Hack2skill."

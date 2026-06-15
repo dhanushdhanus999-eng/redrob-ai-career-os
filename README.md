@@ -80,7 +80,7 @@ fully implemented and validated for schema correctness locally.
 | **Full 8-signal formula** | **Sr NLP Eng (0.82), Sr ML Eng (0.81), Sr ML Eng (0.77), Lead AI Eng (0.76), Applied Sci (0.75)** | **✅** |
 | + LTR reranking | *(active by default — `outputs/models/ltr_model.pkl` ships trained)* | See note ↓ |
 | + Cross-encoder | *(BGE-reranker on top-50, active by default)* | Expected improvement |
-| + LLM re-rank | *(Gemini race-runner on top-30, `--llm-rerank` flag)* | Expected improvement |
+| + LLM re-rank | *(local Ollama listwise on top-30, `--llm-rerank` flag)* | Expected improvement |
 
 > NDCG/MAP/P@10 are computed server-side on hidden labels. Scores reported after organiser evaluation.
 
@@ -227,7 +227,7 @@ outputs/             runtime — models, cache, submissions (git-ignored)
 | Submission ranking | `rank-bm25` + nine-signal scoring + consistency filter — CPU-only, network-free |
 | Recall (offline research) | `sentence-transformers` (BGE-large-en-v1.5), FAISS HNSW |
 | Features | `rapidfuzz`, `scikit-learn`, custom skill ontology, internal-consistency checks |
-| Offline rerankers | BGE-reranker cross-encoder; LightGBM LambdaRank blend; Gemini listwise (analysis only — never in the submitted CSV) |
+| Offline rerankers | BGE-reranker cross-encoder; LightGBM LambdaRank blend; local-Ollama listwise (analysis only — never in the submitted CSV) |
 | Demo | Gradio 5, Plotly |
 | Evaluation | NDCG / MAP / precision, submission contract validator |
 | Reproducibility | Makefile, Dockerfile, pinned `requirements.txt` |
