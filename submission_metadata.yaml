@@ -3,18 +3,18 @@
 # Fill in every <PLACEHOLDER> before submitting. The CSV filename you upload
 # MUST be your registered participant ID, e.g. team_xxx.csv.
 
-team_name: "<YOUR_TEAM_NAME>"
+team_name: "Axiom"
 
 primary_contact:
-  name: "<YOUR_NAME>"
-  email: "<YOUR_EMAIL>"
-  phone: "<YOUR_PHONE>"
+  name: "Dhanush M"
+  email: "dhanushdhnaus999@gmail.com"
+  phone: "9148425222"
 
 team_members:
-  - name: "<YOUR_NAME>"
-    email: "<YOUR_EMAIL>"
+  - name: "Dhanush M"
+    email: "dhanushdhnaus999@gmail.com"
 
-github_repository_url: "https://github.com/<USERNAME>/<REPO>"
+github_repository_url: "https://github.com/dhanushdhanus999-eng/redrob-ai-career-os"
 
 # A working hosted environment where the ranking system can be run on a small
 # sample (HuggingFace Spaces / Streamlit Cloud / Replit / Colab / Docker / Binder).
@@ -25,6 +25,8 @@ sandbox_demo_link: "https://huggingface.co/spaces/Dhanush9145/india-runs-ranking
 # Claude / ChatGPT / Copilot / Cursor / Gemini / Other / None
 ai_tools_declared:
   - "Claude"
+  - "ChatGPT"
+  - "Other"
 
 compute_environment_summary: >-
   Windows 11, 16 GB RAM, Python 3.13, CPU-only. The ranking step (rank.py) runs
@@ -49,4 +51,4 @@ methodology_summary: >-
   candidates.jsonl --out submission.csv`.
 
 # The single command that reproduces the submission CSV from the candidates file.
-reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
+reproduce_command: "python rank.py --candidates ./data/raw/india_runs_challenge/candidates.jsonl --out ./submission.csv"

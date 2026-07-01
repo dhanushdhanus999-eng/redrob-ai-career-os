@@ -420,6 +420,45 @@ class SkillMatcher:
             "extra_skills_count": len(extra_skills),
         }
 
+    def group_coverage(
+        self,
+        groups: Dict[str, list[str]],
+        candidate_skills: list[str],
+    ) -> dict:
+        """Score capability *coverage* across a set of skill groups.
+
+        Each group is a capability area (e.g. "Vector databases") whose members
+        are substitutable tools. A group counts as covered when the candidate
+        matches ANY member — exact, same-family, or fuzzy — so a candidate who
+        knows one vector DB gets full credit for that capability rather than a
+        diluted 1/8. Returns the covered group names, the coverage fraction, and
+        the concrete member skills that triggered each hit (for explanations).
+        """
+        covered: list[str] = []
+        matched_members: Dict[str, list[str]] = {}
+        for group_name, members in groups.items():
+            result = self.match_score(members, candidate_skills)
+            n_hit = (
+                result["n_exact_matched"]
+                + result["n_family_matched"]
+                + result["n_fuzzy_matched"]
+            )
+            if n_hit > 0:
+                covered.append(group_name)
+                # matched_skills holds the exact hits; fall back to the whole
+                # group name when only a family/fuzzy match fired.
+                matched_members[group_name] = result["matched_skills"] or [group_name]
+
+        total = len(groups)
+        coverage = len(covered) / total if total else 0.0
+        return {
+            "covered_groups": covered,
+            "n_covered": len(covered),
+            "n_total": total,
+            "coverage": round(coverage, 4),
+            "matched_members": matched_members,
+        }
+
     @staticmethod
     def _empty_result() -> dict:
         return {

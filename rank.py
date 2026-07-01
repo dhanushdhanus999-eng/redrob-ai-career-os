@@ -38,8 +38,10 @@ from src.utils.skill_ontology import SkillMatcher
 
 # Shared, dependency-free Track-1 JD constants (no torch/faiss import cost).
 from src.utils.track1_spec import (
+    INDIA_LOCATION_TOKENS,
     TRACK1_MAX_YEARS,
     TRACK1_MIN_YEARS,
+    TRACK1_MUST_HAVE_GROUPS,
     TRACK1_MUST_HAVE_SKILLS,
     TRACK1_NICE_TO_HAVE_SKILLS,
     TRACK1_JOB_TITLE,
@@ -86,12 +88,7 @@ def score_experience(cand_years: float, min_years: float, max_years: float) -> f
 
 def score_location(candidate_location: str) -> float:
     loc = str(candidate_location).lower().strip()
-    india_tokens = (
-        "india", "pune", "noida", "bangalore", "bengaluru", "hyderabad",
-        "mumbai", "delhi", "chennai", "gurugram", "gurgaon", "kolkata",
-        "ahmedabad", "jaipur", "kochi",
-    )
-    if any(t in loc for t in india_tokens):
+    if any(t in loc for t in INDIA_LOCATION_TOKENS):
         return 1.0
     if not loc or loc in ("nan", "none", "not specified"):
         return 0.55
@@ -233,7 +230,13 @@ def rank(candidates: pd.DataFrame, *, recall_k: int) -> pd.DataFrame:
 
         must_match = skill_matcher.match_score(must_skills, cand_skills)
         nice_match = skill_matcher.match_score(nice_skills, cand_skills)
-        skill_score = must_match["composite_score"] * 0.75 + nice_match["composite_score"] * 0.25
+        # Must-have signal is driven by *capability-group* coverage (a candidate
+        # needs one vector DB, not all eight), with a light depth term so richer
+        # profiles still break ties. This rewards breadth across the JD's real
+        # capability areas rather than redundant tokens within one.
+        group_cov = skill_matcher.group_coverage(TRACK1_MUST_HAVE_GROUPS, cand_skills)
+        must_score = 0.85 * group_cov["coverage"] + 0.15 * must_match["composite_score"]
+        skill_score = must_score * 0.75 + nice_match["composite_score"] * 0.25
 
         exp_score = score_experience(cand_years, min_years, max_years)
         beh_score, _recency = score_behavior(row)
@@ -264,6 +267,8 @@ def rank(candidates: pd.DataFrame, *, recall_k: int) -> pd.DataFrame:
             "candidate_id": str(cid),
             "overall": overall,
             "matched_must": list(must_match.get("matched_skills", [])),
+            "covered_groups": group_cov["covered_groups"],
+            "n_groups_total": group_cov["n_total"],
             "matched_nice": nice_matched,
             "cand_years": cand_years,
             "current_title": _safe_text(row.get("current_role")),
@@ -297,6 +302,8 @@ def rank(candidates: pd.DataFrame, *, recall_k: int) -> pd.DataFrame:
                 matched_must=s["matched_must"],
                 matched_nice=s["matched_nice"],
                 n_must_total=len(must_skills),
+                matched_groups=s["covered_groups"],
+                n_groups_total=s["n_groups_total"],
                 current_title=s["current_title"],
                 cand_years_exp=s["cand_years"],
                 location=s["location"],

@@ -19,6 +19,7 @@ from typing import Iterable, Sequence
 import pandas as pd
 
 from src.utils.skill_ontology import SkillMatcher
+from src.utils.track1_spec import INDIA_LOCATION_TOKENS
 
 
 matcher = SkillMatcher()
@@ -83,6 +84,8 @@ def build_reasoning(
     matched_must: Sequence[str],
     matched_nice: Sequence[str],
     n_must_total: int,
+    matched_groups: Sequence[str] | None = None,
+    n_groups_total: int = 0,
     current_title: str = "",
     cand_years_exp: float = 0.0,
     location: str = "",
@@ -123,14 +126,28 @@ def build_reasoning(
             )
 
     # ── Skill match against the JD (JD connection) ──────────────────────────
-    must_hits = [s for s in matched_must if s]
-    if must_hits:
-        shown = ", ".join(must_hits[:3])
-        facts.append(
-            f"covers {len(must_hits)}/{n_must_total} must-have skills ({shown})"
-        )
+    # Prefer capability-group coverage ("5/7 core capabilities") over a raw
+    # token count over the 25 granular must-haves, which reads misleadingly low
+    # for strong specialists. Fall back to the token phrasing when groups aren't
+    # supplied (keeps the offline explain_ranking path working unchanged).
+    if matched_groups is not None and n_groups_total:
+        group_hits = [g for g in matched_groups if g]
+        if group_hits:
+            shown = ", ".join(group_hits[:3])
+            facts.append(
+                f"covers {len(group_hits)}/{n_groups_total} core capabilities ({shown})"
+            )
+        else:
+            concerns.append("no direct match on the core capability areas")
     else:
-        concerns.append("no direct match on the must-have skill list")
+        must_hits = [s for s in matched_must if s]
+        if must_hits:
+            shown = ", ".join(must_hits[:3])
+            facts.append(
+                f"covers {len(must_hits)}/{n_must_total} must-have skills ({shown})"
+            )
+        else:
+            concerns.append("no direct match on the must-have skill list")
 
     nice_hits = [s for s in matched_nice if s]
     if nice_hits:
@@ -142,12 +159,8 @@ def build_reasoning(
 
     # ── Location (India / Pune-Noida hybrid context) ────────────────────────
     loc = (location or "").strip()
-    india_tokens = (
-        "india", "pune", "noida", "bangalore", "bengaluru", "hyderabad",
-        "mumbai", "delhi", "chennai", "gurugram", "gurgaon", "kolkata",
-    )
     if loc:
-        if any(t in loc.lower() for t in india_tokens):
+        if any(t in loc.lower() for t in INDIA_LOCATION_TOKENS):
             facts.append(f"based in {loc}")
         else:
             concerns.append(f"based in {loc}, outside India for a Pune/Noida hybrid role")
