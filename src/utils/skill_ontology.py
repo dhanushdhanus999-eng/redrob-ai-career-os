@@ -113,7 +113,6 @@ SKILL_SYNONYMS: Dict[str, str] = {
     "openai api": "OpenAI API",
     "anthropic": "Anthropic SDK",
     "anthropic sdk": "Anthropic SDK",
-    "claude": "Anthropic SDK",
     "gpt-4": "OpenAI API",
     "chatgpt": "OpenAI API",
     "llama": "Llama",

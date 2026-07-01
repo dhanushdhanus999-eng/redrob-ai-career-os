@@ -22,9 +22,8 @@ github_repository_url: "https://github.com/dhanushdhanus999-eng/redrob-ai-career
 sandbox_demo_link: "https://huggingface.co/spaces/Dhanush9145/india-runs-ranking"
 
 # Honest declaration (not penalised). Multi-select from:
-# Claude / ChatGPT / Copilot / Cursor / Gemini / Other / None
+# ChatGPT / Copilot / Cursor / Gemini / Other / None
 ai_tools_declared:
-  - "Claude"
   - "ChatGPT"
   - "Other"
 
