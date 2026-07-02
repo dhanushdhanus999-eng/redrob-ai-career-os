@@ -38,6 +38,7 @@ from src.retrieval.bm25_retriever import BM25Retriever
 from src.utils.paths import MODELS_DIR
 from src.utils.role_relevance import score_career_trajectory, score_role_relevance
 from src.utils.skill_ontology import SKILL_FAMILIES, SKILL_SYNONYMS, SkillMatcher, normalize_skill
+from src.utils.track1_spec import INDIA_LOCATION_TOKENS
 
 
 BM25_DEMO_INDEX = MODELS_DIR / "bm25_demo_index.pkl"
@@ -829,12 +830,7 @@ def extract_skill_mentions(text: str, *, max_skills: int = 16) -> list[str]:
 def score_location(candidate_location: str) -> float:
     """Score candidate location fit for a Pune/Noida hybrid role in India."""
     loc = str(candidate_location).lower().strip()
-    india_tokens = (
-        "india", "pune", "noida", "bangalore", "bengaluru",
-        "hyderabad", "mumbai", "delhi", "chennai", "gurugram",
-        "gurgaon", "kolkata", "ahmedabad", "jaipur", "kochi",
-    )
-    if any(t in loc for t in india_tokens):
+    if any(t in loc for t in INDIA_LOCATION_TOKENS):
         return 1.0
     if not loc or loc in ("nan", "none", "not specified", ""):
         return 0.55
